@@ -393,7 +393,7 @@ static const uint32_t K256[64] = {
 static inline void sha256_arm64_compress(uint32_t state[8], const uint8_t block[64]) {
 uint32x4_t STATE0, STATE1, ABEF_SAVE, CDGH_SAVE;
 uint32x4_t MSG0, MSG1, MSG2, MSG3;
-uint32x4_t TMP0, TMP1, TMP2;
+uint32x4_t TMP0, TMP1;
 
 // Load state
 STATE0 = vld1q_u32(&state[0]); // ABCD
@@ -658,8 +658,10 @@ size_t simd_len = len & ~15;
 for (size_t i = 0; i < simd_len; i += 16) {
     uint8x16_t bytes = vld1q_u8(data + i);
     // Process each byte individually (hex conversion is hard to vectorize efficiently)
+    uint8_t temp[16];
+    vst1q_u8(temp, bytes);  // Store NEON vector to array
     for (int j = 0; j < 16; j++) {
-        uint8_t b = vgetq_lane_u8(bytes, j);
+        uint8_t b = temp[j];  // Now valid - array indexing
         out.push_back(lut[b >> 4]);
         out.push_back(lut[b & 0x0F]);
     }
