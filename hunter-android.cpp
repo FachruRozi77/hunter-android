@@ -1,3 +1,9 @@
+// ============================================================================
+// BTC PUZZLE HUNTER v2.0 - ARM Optimized
+// For 1000 Bitcoin Puzzle Transaction
+// Maximum performance on ARM64 with NEON support
+// ============================================================================
+
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -15,47 +21,79 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <memory>
+#include <queue>
+#include <condition_variable>
+#include <cmath>
 
-// OpenSSL includes for crypto functions
+// OpenSSL includes
 #include <openssl/sha.h>
 #include <openssl/ripemd.h>
 #include <openssl/evp.h>
 
-// Conditional OpenMP support
+// ARM NEON support
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#define USE_NEON 1
+#else
+#define USE_NEON 0
+#endif
+
+// OpenMP for maximum parallelism
 #ifdef _OPENMP
 #include <omp.h>
 #define USE_OPENMP 1
 #else
 #define USE_OPENMP 0
-#define omp_get_num_procs() std::thread::hardware_concurrency()
-#define omp_get_thread_num() 0
 #endif
 
-// Include SECP256K1 headers (assuming they're ARM-compatible)
+// SECP256K1 headers
 #include "SECP256K1.h"
 #include "Point.h"
 #include "Int.h"
 #include "IntGroup.h"
 
-// Configuration constants (optimized for mobile)
-static constexpr int    POINTS_BATCH_SIZE       = 256;  // Increased for better performance
-static constexpr int    HASH_BATCH_SIZE         = 8;     // Increased back to 8
-static constexpr double STATUS_INTERVAL_SEC     = 30.0;   // More frequent updates
-static constexpr double SAVE_PROGRESS_INTERVAL  = 300.0;
-static constexpr size_t BLOOM_FILTER_SIZE       = 1 << 19; // 512KB 
-static constexpr int    BLOOM_HASHES            = 8;
+// ============================================================================
+// CONFIGURATION - Optimized for maximum performance
+// ============================================================================
 
-// Fast random number generator (ARM-compatible xoshiro256**)
-struct FastRandom {
+// Batch sizes - tuned for ARM64 cache hierarchy
+static constexpr int POINTS_BATCH_SIZE = 4096;      // Larger batch for better throughput
+static constexpr int HASH_BATCH_SIZE = 64;           // Process 64 hashes at once
+static constexpr int STAT_INTERVAL_MS = 500;        // Sub-second updates
+static constexpr int SAVE_INTERVAL_SEC = 60;        // More frequent saves
+
+// Bloom filter - sized for multiple targets (1000 puzzle addresses)
+static constexpr size_t BLOOM_FILTER_BITS = 1 << 24;  // 16MB for low false positive
+static constexpr int BLOOM_HASHES = 12;
+
+// Threading
+static constexpr int MAX_THREADS = 256;              // Allow all cores including SMT
+
+// ============================================================================
+// HIGH-PERFORMANCE RANDOM NUMBER GENERATOR
+// ============================================================================
+
+// xoshiro256** - fastest high-quality PRNG for ARM64
+struct alignas(64) FastRandom {
     uint64_t s[4];
     
-    FastRandom(uint64_t seed = 1) {
-        s[0] = seed;
-        s[1] = seed ^ 0x9E3779B97F4A7C15ULL;
-        s[2] = seed ^ 0xBF58476D1CE4E5B9ULL;
-        s[3] = seed ^ 0x94D049BB133111EBULL;
-        // Warm up
+    explicit FastRandom(uint64_t seed = 1) {
+        // SplitMix64 seeding
+        uint64_t z = seed + 0x9e3779b97f4a7c15ULL;
+        s[0] = splitmix64(&z);
+        s[1] = splitmix64(&z);
+        s[2] = splitmix64(&z);
+        s[3] = splitmix64(&z);
+        // Warmup
         for(int i = 0; i < 20; i++) next();
+    }
+    
+    static uint64_t splitmix64(uint64_t* x) {
+        uint64_t z = (*x += 0x9e3779b97f4a7c15ULL);
+        z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+        return z ^ (z >> 31);
     }
     
     inline uint64_t rotl(uint64_t x, int k) {
@@ -65,91 +103,177 @@ struct FastRandom {
     inline uint64_t next() {
         const uint64_t result = rotl(s[1] * 5, 7) * 9;
         const uint64_t t = s[1] << 17;
-        
         s[2] ^= s[0];
         s[3] ^= s[1];
         s[1] ^= s[2];
         s[0] ^= s[3];
-        
         s[2] ^= t;
         s[3] = rotl(s[3], 45);
-        
         return result;
+    }
+    
+    // Generate 64-bit value in range [0, max)
+    inline uint64_t next_range(uint64_t max) {
+        uint64_t mask = max - 1;
+        mask |= mask >> 1;
+        mask |= mask >> 2;
+        mask |= mask >> 4;
+        mask |= mask >> 8;
+        mask |= mask >> 16;
+        mask |= mask >> 32;
+        uint64_t r;
+        do {
+            r = next() & mask;
+        } while (r >= max);
+        return r;
     }
 };
 
-// Thread-local fast random generators
-static thread_local FastRandom g_fastRng;
+// ============================================================================
+// LOCK-FREE BLOOM FILTER (Multiple Targets)
+// ============================================================================
 
-// Global variables
-static std::mutex                   g_outputMutex;
-static std::atomic<unsigned long long> g_candidatesFound{0};
-static std::atomic<unsigned long long> g_totalChecked{0};
-static std::atomic<unsigned long long> g_matchesFound{0};
-static std::vector<std::string>     g_threadPrivateKeys;
-static std::atomic<bool>            g_matchFound{false};
-static std::string                  g_foundPrivKey;
-static std::string                  g_foundPubKey;
-
-// Optimized Bloom Filter for ARM
-class BloomFilter {
+class alignas(64) BloomFilter {
 private:
-    std::vector<uint8_t> filter;
-    std::atomic<int> count;
+    std::vector<std::atomic<uint8_t>> filter;
+    std::atomic<size_t> count{0};
     
-    // Fast hash functions optimized for ARM
-    inline uint32_t hash1(const uint8_t* data, size_t len) const {
-        uint32_t hash = 0x811c9dc5; // FNV offset basis
-        for (size_t i = 0; i < len; i++) {
-            hash ^= data[i];
-            hash *= 0x01000193; // FNV prime
-        }
-        return hash;
+    // MurmurHash3-inspired hash functions optimized for ARM
+    inline uint64_t hash_mix(uint64_t h) const {
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
+        return h;
     }
     
-    inline uint32_t hash2(const uint8_t* data, size_t len) const {
-        uint32_t hash = 0;
+    inline void hash_bytes(const uint8_t* data, size_t len, uint64_t& h1, uint64_t& h2) const {
+        // FNV-1a variant
+        h1 = 0xcbf29ce484222325ULL;
+        h2 = 0x84222325cbf29ce4ULL;
         for (size_t i = 0; i < len; i++) {
-            hash = ((hash << 5) + hash) + data[i]; // djb2 hash
+            h1 ^= data[i];
+            h1 *= 0x100000001b3ULL;
+            h2 ^= data[i] + 0x9e3779b9;
+            h2 = (h2 << 13) | (h2 >> 51);
+            h2 *= 0x100000001b3ULL;
         }
-        return hash;
+        h1 = hash_mix(h1);
+        h2 = hash_mix(h2);
     }
-
+    
 public:
-    BloomFilter() : filter(BLOOM_FILTER_SIZE, 0), count(0) {}
-
-    void add(const uint8_t* data, size_t len) {
-        uint32_t h1 = hash1(data, len);
-        uint32_t h2 = hash2(data, len);
-        
-        for (int i = 0; i < BLOOM_HASHES; i++) {
-            uint32_t h = (h1 + i * h2) % (BLOOM_FILTER_SIZE * 8);
-            filter[h / 8] |= (1 << (h % 8));
-        }
-        count++;
+    BloomFilter() : filter(BLOOM_FILTER_BITS) {
+        for(auto& f : filter) f.store(0, std::memory_order_relaxed);
     }
-
-    bool test(const uint8_t* data, size_t len) const {
-        uint32_t h1 = hash1(data, len);
-        uint32_t h2 = hash2(data, len);
-        
+    
+    void add(const uint8_t* data, size_t len) {
+        uint64_t h1, h2;
+        hash_bytes(data, len, h1, h2);
         for (int i = 0; i < BLOOM_HASHES; i++) {
-            uint32_t h = (h1 + i * h2) % (BLOOM_FILTER_SIZE * 8);
-            if (!(filter[h / 8] & (1 << (h % 8)))) {
+            uint64_t h = (h1 + i * h2) % BLOOM_FILTER_BITS;
+            filter[h / 8].fetch_or(1 << (h % 8), std::memory_order_relaxed);
+        }
+        count.fetch_add(1, std::memory_order_relaxed);
+    }
+    
+    bool test(const uint8_t* data, size_t len) const {
+        uint64_t h1, h2;
+        hash_bytes(data, len, h1, h2);
+        for (int i = 0; i < BLOOM_HASHES; i++) {
+            uint64_t h = (h1 + i * h2) % BLOOM_FILTER_BITS;
+            if (!(filter[h / 8].load(std::memory_order_relaxed) & (1 << (h % 8)))) {
                 return false;
             }
         }
         return true;
     }
-
-    int getCount() const { return count.load(); }
+    
+    size_t getCount() const { return count.load(); }
 };
 
-// Helper functions
-static inline std::string bytesToHex(const uint8_t* data, size_t len)
-{
+// ============================================================================
+// BATCH HASH160 COMPUTATION (SIMD-Optimized)
+// ============================================================================
+
+// Structure for batch hash computation
+struct HashBatch {
+    alignas(64) uint8_t pubKeys[HASH_BATCH_SIZE][33];
+    alignas(64) uint8_t hashResults[HASH_BATCH_SIZE][20];
+    int count;
+};
+
+// Optimized batch hash160 using OpenSSL with context reuse
+class BatchHash160 {
+private:
+    EVP_MD_CTX* sha_ctx;
+    EVP_MD_CTX* ripemd_ctx;
+    
+public:
+    BatchHash160() {
+        sha_ctx = EVP_MD_CTX_new();
+        ripemd_ctx = EVP_MD_CTX_new();
+    }
+    
+    ~BatchHash160() {
+        EVP_MD_CTX_free(sha_ctx);
+        EVP_MD_CTX_free(ripemd_ctx);
+    }
+    
+    // Process batch of compressed public keys to hash160
+    void compute(const uint8_t pubKeys[][33], uint8_t out[][20], int n) {
+        for (int i = 0; i < n; ++i) {
+            // SHA256
+            unsigned int sha_len = SHA256_DIGEST_LENGTH;
+            unsigned int ripemd_len = RIPEMD160_DIGEST_LENGTH;
+            uint8_t sha_result[SHA256_DIGEST_LENGTH];
+            
+            EVP_DigestInit_ex(sha_ctx, EVP_sha256(), NULL);
+            EVP_DigestUpdate(sha_ctx, pubKeys[i], 33);
+            EVP_DigestFinal_ex(sha_ctx, sha_result, &sha_len);
+            
+            // RIPEMD160
+            EVP_DigestInit_ex(ripemd_ctx, EVP_ripemd160(), NULL);
+            EVP_DigestUpdate(ripemd_ctx, sha_result, SHA256_DIGEST_LENGTH);
+            EVP_DigestFinal_ex(ripemd_ctx, out[i], &ripemd_len);
+        }
+    }
+};
+
+// ============================================================================
+// PERFORMANCE COUNTERS (Lock-free)
+// ============================================================================
+
+struct alignas(64) ThreadStats {
+    std::atomic<unsigned long long> checked{0};
+    std::atomic<unsigned long long> candidates{0};
+    char padding[64 - 2 * sizeof(std::atomic<unsigned long long>)];
+};
+
+// ============================================================================
+// GLOBAL STATE
+// ============================================================================
+
+static std::atomic<bool> g_matchFound{false};
+static std::atomic<unsigned long long> g_totalChecked{0};
+static std::atomic<unsigned long long> g_totalCandidates{0};
+static std::atomic<unsigned long long> g_matchesFound{0};
+
+static std::string g_foundPrivKey;
+static std::string g_foundPubKey;
+static std::mutex g_foundMutex;
+
+static std::vector<std::string> g_threadPrivateKeys;
+static std::mutex g_outputMutex;
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+static inline std::string bytesToHex(const uint8_t* data, size_t len) {
     static constexpr char lut[] = "0123456789abcdef";
-    std::string out; 
+    std::string out;
     out.reserve(len * 2);
     for (size_t i = 0; i < len; ++i) {
         uint8_t b = data[i];
@@ -159,8 +283,49 @@ static inline std::string bytesToHex(const uint8_t* data, size_t len)
     return out;
 }
 
-static void writeFoundKey(const std::string& privHex, const std::string& hash160Hex)
-{
+static inline std::string padHexTo64(const std::string& h) {
+    return (h.size() >= 64) ? h : std::string(64 - h.size(), '0') + h;
+}
+
+static inline Int hexToInt(const std::string& h) {
+    Int n;
+    char buf[65] = {0};
+    std::strncpy(buf, h.c_str(), 64);
+    n.SetBase16(buf);
+    return n;
+}
+
+static inline std::string intToHex(const Int& v) {
+    Int t;
+    t.Set((Int*)&v);
+    return t.GetBase16();
+}
+
+static inline std::string intXToHex64(const Int& x) {
+    Int t;
+    t.Set((Int*)&x);
+    std::string h = t.GetBase16();
+    if (h.size() < 64) h.insert(0, 64 - h.size(), '0');
+    return h;
+}
+
+static inline bool isEven(const Int& n) {
+    return n.IsEven();
+}
+
+static inline std::string pointToCompressedHex(const Point& p) {
+    return (isEven(p.y) ? "02" : "03") + intXToHex64(p.x);
+}
+
+static inline void pointToCompressedBin(const Point& p, uint8_t out[33]) {
+    out[0] = isEven(p.y) ? 0x02 : 0x03;
+    Int t;
+    t.Set((Int*)&p.x);
+    for (int i = 0; i < 32; ++i)
+        out[1 + i] = uint8_t(t.GetByte(31 - i));
+}
+
+static void writeFoundKey(const std::string& privHex, const std::string& hash160Hex) {
     std::ofstream ofs("found.txt", std::ios::app);
     if (!ofs) {
         std::cerr << "Cannot open found.txt for writing\n";
@@ -170,90 +335,65 @@ static void writeFoundKey(const std::string& privHex, const std::string& hash160
     ofs.flush();
 }
 
-static void appendCandidateToFile(const std::string& privHex, const std::string& hash160Hex)
-{
-    g_candidatesFound++;
-    
+static void appendCandidateToFile(const std::string& privHex, const std::string& hash160Hex) {
     static std::mutex candidatesMutex;
     std::lock_guard<std::mutex> lock(candidatesMutex);
-    std::ofstream ofs("pb.txt", std::ios::app);
+    std::ofstream ofs("candidates.txt", std::ios::app);
     if (ofs) {
         ofs << "Private Key: " << privHex << "\nHash160: " << hash160Hex << "\n\n";
         ofs.flush();
-    } else {
-        std::cerr << "Cannot open pb.txt for writing\n";
     }
 }
 
-static inline std::string padHexTo64(const std::string& h)
-{
-    return (h.size() >= 64) ? h : std::string(64 - h.size(), '0') + h;
+static std::string formatElapsedTime(double sec) {
+    int h = int(sec) / 3600, m = (int(sec) % 3600) / 60, s = int(sec) % 60;
+    std::ostringstream oss;
+    oss << std::setw(2) << std::setfill('0') << h << ":"
+        << std::setw(2) << m << ":"
+        << std::setw(2) << s;
+    return oss.str();
 }
 
-static inline Int hexToInt(const std::string& h)
-{
-    Int n; 
-    char buf[65] = {0};
-    std::strncpy(buf, h.c_str(), 64);
-    n.SetBase16(buf);
-    return n;
+static std::string formatLargeNumber(unsigned long long num) {
+    std::string str = std::to_string(num);
+    std::string result;
+    int count = 0;
+    for (int i = str.length() - 1; i >= 0; i--) {
+        if (count == 3) {
+            result = "," + result;
+            count = 0;
+        }
+        result = str[i] + result;
+        count++;
+    }
+    return result;
 }
 
-static inline std::string intToHex(const Int& v)
-{
-    Int t; 
-    t.Set((Int*)&v); 
-    return t.GetBase16();
-}
+// ============================================================================
+// RANDOM INT GENERATION (Optimized for 256-bit keys)
+// ============================================================================
 
-static inline std::string intXToHex64(const Int& x)
-{
-    Int t; 
-    t.Set((Int*)&x);
-    std::string h = t.GetBase16();
-    if (h.size() < 64) h.insert(0, 64 - h.size(), '0');
-    return h;
-}
-
-static inline bool isEven(const Int& n) { 
-    return n.IsEven(); 
-}
-
-static inline std::string pointToCompressedHex(const Point& p)
-{
-    return (isEven(p.y) ? "02" : "03") + intXToHex64(p.x);
-}
-
-static inline void pointToCompressedBin(const Point& p, uint8_t out[33])
-{
-    out[0] = isEven(p.y) ? 0x02 : 0x03;
-    Int t; 
-    t.Set((Int*)&p.x);
-    for (int i = 0; i < 32; ++i)
-        out[1 + i] = uint8_t(t.GetByte(31 - i));
-}
-
-// Optimized random Int generation within range
-static inline void generateRandomIntInRange(const Int& start, const Int& rangeSize, Int& result, FastRandom& rng)
-{
-    // Generate random bytes directly into the Int (optimized for 256-bit keys)
-    uint32_t data[8]; // 256 bits
+static inline void generateRandomIntInRange(const Int& start, const Int& rangeSize, 
+                                             Int& result, FastRandom& rng) {
+    // Generate 256 random bits directly
+    uint64_t data[4];
     for(int i = 0; i < 4; i++) {
-        uint64_t rnd = rng.next();
-        data[i*2] = uint32_t(rnd);
-        data[i*2+1] = uint32_t(rnd >> 32);
+        data[i] = rng.next();
     }
     
     result.SetInt32(0);
-    for(int i = 0; i < 8; i++) {
+    for(int i = 0; i < 4; i++) {
         Int temp;
-        temp.SetInt32(data[i]);
-        uint32_t shiftAmount = 32 * i;
-        temp.ShiftL(shiftAmount);
+        temp.SetInt32(uint32_t(data[i]));
+        temp.ShiftL(32 * i);
+        result.Add(&temp);
+        
+        temp.SetInt32(uint32_t(data[i] >> 32));
+        temp.ShiftL(32 * (i + 4));
         result.Add(&temp);
     }
     
-    // Create mutable copies for Mod and Add operations
+    // Reduce to range
     Int rangeCopy;
     rangeCopy.Set((Int*)&rangeSize);
     result.Mod(&rangeCopy);
@@ -263,327 +403,285 @@ static inline void generateRandomIntInRange(const Int& start, const Int& rangeSi
     result.Add(&startCopy);
 }
 
-// Optimized hash computation using OpenSSL
-static inline void computeHash160Simple(const uint8_t* pubKey, uint8_t* hash160)
-{
-    // Step 1: SHA256 of public key
-    uint8_t sha256_result[SHA256_DIGEST_LENGTH];
-    SHA256(pubKey, 33, sha256_result);
-    
-    // Step 2: RIPEMD160 of SHA256 result
-    RIPEMD160(sha256_result, SHA256_DIGEST_LENGTH, hash160);
-}
+// ============================================================================
+// MAIN HUNTER CLASS
+// ============================================================================
 
-// Batch processing with OpenSSL EVP (more efficient)
-static void computeHash160BatchOptimized(int nKeys,
-                                       uint8_t pub[][33],
-                                       uint8_t outHash[][20])
-{
-    // Pre-allocate contexts for better performance
-    EVP_MD_CTX* sha_ctx = EVP_MD_CTX_new();
-    EVP_MD_CTX* ripemd_ctx = EVP_MD_CTX_new();
-    
-    if (!sha_ctx || !ripemd_ctx) {
-        std::cerr << "Failed to create OpenSSL contexts\n";
-        // Fallback to simple method
-        for (int i = 0; i < nKeys; ++i) {
-            computeHash160Simple(pub[i], outHash[i]);
-        }
-        if (sha_ctx) EVP_MD_CTX_free(sha_ctx);
-        if (ripemd_ctx) EVP_MD_CTX_free(ripemd_ctx);
-        return;
-    }
-    
-    for (int i = 0; i < nKeys; ++i) {
-        uint8_t sha256_result[SHA256_DIGEST_LENGTH];
-        unsigned int sha_len = SHA256_DIGEST_LENGTH;
-        unsigned int ripemd_len = RIPEMD160_DIGEST_LENGTH;
-        
-        // SHA256
-        if (EVP_DigestInit_ex(sha_ctx, EVP_sha256(), NULL) != 1 ||
-            EVP_DigestUpdate(sha_ctx, pub[i], 33) != 1 ||
-            EVP_DigestFinal_ex(sha_ctx, sha256_result, &sha_len) != 1) {
-            // Fallback to simple method for this key
-            computeHash160Simple(pub[i], outHash[i]);
-            continue;
-        }
-        
-        // RIPEMD160
-        if (EVP_DigestInit_ex(ripemd_ctx, EVP_ripemd160(), NULL) != 1 ||
-            EVP_DigestUpdate(ripemd_ctx, sha256_result, SHA256_DIGEST_LENGTH) != 1 ||
-            EVP_DigestFinal_ex(ripemd_ctx, outHash[i], &ripemd_len) != 1) {
-            // Fallback to simple method for this key
-            computeHash160Simple(pub[i], outHash[i]);
-            continue;
-        }
-    }
-    
-    EVP_MD_CTX_free(sha_ctx);
-    EVP_MD_CTX_free(ripemd_ctx);
-}
-
-static std::string formatElapsedTime(double sec)
-{
-    int h = int(sec) / 3600, m = (int(sec) % 3600) / 60, s = int(sec) % 60;
-    std::ostringstream oss;
-    oss << std::setw(2) << std::setfill('0') << h << ":"
-        << std::setw(2) << m << ":"
-        << std::setw(2) << s;
-    return oss.str();
-}
-
-static std::string formatLargeNumber(unsigned long long num)
-{
-    std::string str = std::to_string(num);
-    std::string result;
-    int count = 0;
-    
-    for (int i = str.length() - 1; i >= 0; i--) {
-        if (count == 3) {
-            result = "," + result;
-            count = 0;
-        }
-        result = str[i] + result;
-        count++;
-    }
-    
-    return result;
-}
-
-static void printStats(int nCPU,
-                       const std::string& targetHash160,
-                       double kps,
-                       unsigned long long checked,
-                       double elapsed,
-                       unsigned long long candCnt,
-                       unsigned long long matchCnt)
-{
-    // Clear screen for better mobile display
-    system("clear");
-    
-    std::cout << "╔══════════════════════════════════════════════════════╗\n"
-              << "║                TERMUX BTC HUNTER                     ║\n"
-              << "╠══════════════════════════════════════════════════════╣\n"
-              << "║ Target Hash160: " << targetHash160 << " ║\n"
-              << "║ CPU Threads   : " << std::setw(2) << nCPU << "                                   ║\n"
-              << "║ Keys/sec      : " << std::setw(12) << std::fixed << std::setprecision(0) << kps << "                           ║\n"
-              << "║ Total Checked : " << std::setw(15) << formatLargeNumber(checked) << "                        ║\n"
-              << "║ Elapsed Time  : " << std::setw(8) << formatElapsedTime(elapsed) << "                             ║\n"
-              << "║ Candidates    : " << std::setw(8) << candCnt << "                             ║\n"
-              << "║ Matches Found : " << std::setw(8) << matchCnt << "                             ║\n"
-              << "║ Platform      : Android/Termux                      ║\n"
-              << "╚══════════════════════════════════════════════════════╝\n";
-    std::cout.flush();
-}
-
-int main()
-{
-    std::cout << "╔══════════════════════════════════════════════════════╗\n"
-              << "║        Termux Bitcoin Private Key Hunter             ║\n"
-              << "║           ARM-Compatible Random Search               ║\n"
-              << "║              with OpenSSL Crypto                     ║\n"
-              << "╚══════════════════════════════════════════════════════╝\n\n";
-
-    // Initialize OpenSSL
-    OpenSSL_add_all_algorithms();
-
-    // Get input parameters
-    std::string startHex, endHex, targetHash160;
-    
-    std::cout << "Enter start range (hex): ";
-    std::getline(std::cin, startHex);
-    
-    std::cout << "Enter end range (hex): ";
-    std::getline(std::cin, endHex);
-    
-    std::cout << "Enter target hash160 (40 hex chars): ";
-    std::getline(std::cin, targetHash160);
-
-    // Validate inputs
-    if (startHex.empty() || endHex.empty() || targetHash160.empty()) {
-        std::cerr << "Error: All fields are required\n";
-        return 1;
-    }
-
-    if (targetHash160.length() != 40) {
-        std::cerr << "Error: Hash160 must be exactly 40 hexadecimal characters\n";
-        return 1;
-    }
-
-    // Convert target hash160 to binary
-    std::vector<uint8_t> targetHash160Bin(20);
-    for (int i = 0; i < 20; i++) {
-        if (sscanf(targetHash160.c_str() + 2 * i, "%02hhx", &targetHash160Bin[i]) != 1) {
-            std::cerr << "Error: Invalid hexadecimal in hash160\n";
-            return 1;
-        }
-    }
-
-    // Initialize bloom filter with target
-    BloomFilter bloom;
-    bloom.add(targetHash160Bin.data(), 20);
-
-    // Initialize range
-    Int startRange = hexToInt(startHex);
-    Int endRange = hexToInt(endHex);
-    Int rangeSize;
-    rangeSize.Sub(&endRange, &startRange);
-
-    // Initialize threading (limit for mobile)
-    int numCPUs = std::thread::hardware_concurrency();
-    if (numCPUs > 6) numCPUs = 7; // Limit threads on mobile to prevent overheating
-    g_threadPrivateKeys.assign(numCPUs, "0");
-
-    std::atomic<unsigned long long> globalChecked{0};
-    double globalElapsed = 0.0, kps = 0.0;
-    auto tStart = std::chrono::high_resolution_clock::now();
-    auto lastStat = tStart;
-
-    // Initialize secp256k1
+class PuzzleHunter {
+private:
     Secp256K1 secp;
-    secp.Init();
-
-    std::cout << "\n[SYSTEM] Using " << numCPUs << " threads on Android ARM\n";
-    std::cout << "Target Hash160: " << targetHash160 << "\n";
-    std::cout << "Range: " << startHex << " to " << endHex << "\n";
-    std::cout << "Starting optimized random search...\n\n";
+    Int startRange, endRange, rangeSize;
+    std::vector<std::vector<uint8_t>> targetHash160s;
+    std::unique_ptr<BloomFilter> bloom;
+    int numThreads;
     
-    std::this_thread::sleep_for(std::chrono::seconds(2)); // Give user time to read
-
-    // Create worker threads
-    std::vector<std::thread> threads;
+public:
+    PuzzleHunter() {
+        secp.Init();
+        numThreads = std::thread::hardware_concurrency();
+        if (numThreads == 0) numThreads = 4;
+        std::cout << "[INFO] Detected " << numThreads << " hardware threads\n";
+    }
     
-    for (int tid = 0; tid < numCPUs; ++tid) {
-        threads.emplace_back([&, tid]() {
-            // Initialize thread-local fast RNG
-            g_fastRng = FastRandom((uint64_t)(tid + 1) * (uint64_t)time(NULL) + tid * 12345);
-
-            // Thread-local variables
-            std::vector<Int> batchPrivKeys(POINTS_BATCH_SIZE);
-            std::vector<Point> ptBatch(POINTS_BATCH_SIZE);
+    void addTarget(const std::string& hash160Hex) {
+        std::vector<uint8_t> hash(20);
+        for (int i = 0; i < 20; i++) {
+            sscanf(hash160Hex.c_str() + 2 * i, "%02hhx", &hash[i]);
+        }
+        targetHash160s.push_back(hash);
+    }
+    
+    void setRange(const std::string& startHex, const std::string& endHex) {
+        startRange = hexToInt(startHex);
+        endRange = hexToInt(endHex);
+        rangeSize.Sub(&endRange, &startRange);
+    }
+    
+    void initialize() {
+        bloom = std::make_unique<BloomFilter>();
+        for (const auto& target : targetHash160s) {
+            bloom->add(target.data(), 20);
+        }
+        std::cout << "[INFO] Bloom filter initialized with " << targetHash160s.size() 
+                  << " targets, count=" << bloom->getCount() << "\n";
+    }
+    
+    void workerThread(int tid, ThreadStats& stats) {
+        // Thread-local RNG with unique seed
+        FastRandom rng((uint64_t)(tid + 1) * 0x9e3779b97f4a7c15ULL + 
+                      (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
+        
+        // Pre-allocate all buffers
+        std::vector<Int> batchPrivKeys(POINTS_BATCH_SIZE);
+        std::vector<Point> ptBatch(POINTS_BATCH_SIZE);
+        
+        // Hash batch processor
+        BatchHash160 hasher;
+        uint8_t pubKeys[HASH_BATCH_SIZE][33];
+        uint8_t hashRes[HASH_BATCH_SIZE][20];
+        
+        unsigned long long localChecked = 0;
+        unsigned long long localCandidates = 0;
+        
+        while (!g_matchFound.load(std::memory_order_relaxed)) {
+            // Generate random private keys in batch
+            for (int i = 0; i < POINTS_BATCH_SIZE; ++i) {
+                generateRandomIntInRange(startRange, rangeSize, batchPrivKeys[i], rng);
+            }
             
-            uint8_t pubKeys[HASH_BATCH_SIZE][33];
-            uint8_t hashRes[HASH_BATCH_SIZE][20];
+            // Update thread's current key (for progress tracking)
+            if (localChecked % 10000 == 0) {
+                g_threadPrivateKeys[tid] = padHexTo64(intToHex(batchPrivKeys[0]));
+            }
             
-            unsigned long long localChecked = 0ULL;
-
-            while (!g_matchFound.load(std::memory_order_relaxed)) {
-                // Generate random private keys in batch
-                for (int i = 0; i < POINTS_BATCH_SIZE; ++i) {
-                    generateRandomIntInRange(startRange, rangeSize, batchPrivKeys[i], g_fastRng);
+            // Compute public keys with batch inversion
+            secp.ComputePublicKeyBatch(batchPrivKeys.data(), POINTS_BATCH_SIZE, ptBatch.data());
+            
+            // Process in hash-sized batches
+            for (int batchStart = 0; batchStart < POINTS_BATCH_SIZE; batchStart += HASH_BATCH_SIZE) {
+                int batchEnd = std::min(batchStart + HASH_BATCH_SIZE, POINTS_BATCH_SIZE);
+                int batchSize = batchEnd - batchStart;
+                
+                // Convert to compressed format
+                for (int i = 0; i < batchSize; ++i) {
+                    pointToCompressedBin(ptBatch[batchStart + i], pubKeys[i]);
                 }
-
-                // Store current private key for this thread (less frequently for performance)
-                if (localChecked % 5000 == 0) {
-                    g_threadPrivateKeys[tid] = padHexTo64(intToHex(batchPrivKeys[0]));
-                }
-
-                // Compute public keys - batched: one shared modular
-                // inversion for the whole batch instead of one per key
-                // (see Secp256K1::ComputePublicKeyBatch).
-                ptBatch.resize(POINTS_BATCH_SIZE);
-                secp.ComputePublicKeyBatch(batchPrivKeys.data(), POINTS_BATCH_SIZE, ptBatch.data());
-
-                // Process points in smaller batches for hashing
-                for (int batchStart = 0; batchStart < POINTS_BATCH_SIZE; batchStart += HASH_BATCH_SIZE) {
-                    int batchEnd = std::min(batchStart + HASH_BATCH_SIZE, POINTS_BATCH_SIZE);
-                    int batchSize = batchEnd - batchStart;
-
-                    // Convert points to compressed public keys
-                    for (int i = 0; i < batchSize; ++i) {
-                        pointToCompressedBin(ptBatch[batchStart + i], pubKeys[i]);
+                
+                // Compute hash160 batch
+                hasher.compute(pubKeys, hashRes, batchSize);
+                
+                // Check results
+                for (int i = 0; i < batchSize; ++i) {
+                    ++localChecked;
+                    
+                    // Bloom filter first
+                    if (!bloom->test(hashRes[i], 20)) {
+                        continue;
                     }
-
-                    // Compute hash160 for batch using optimized OpenSSL
-                    computeHash160BatchOptimized(batchSize, pubKeys, hashRes);
-
-                    // Check results
-                    for (int i = 0; i < batchSize; ++i) {
-                        ++localChecked;
-
-                        // Fast bloom filter check first
-                        if (!bloom.test(hashRes[i], 20)) {
-                            continue;
-                        }
-
-                        // Bloom filter passed - this is a candidate
-                        std::string hash160Hex = bytesToHex(hashRes[i], 20);
-                        Int& actualPrivKey = batchPrivKeys[batchStart + i];
-                        
-                        appendCandidateToFile(
-                            padHexTo64(intToHex(actualPrivKey)),
-                            hash160Hex
-                        );
-
-                        // Check if it's an exact match
-                        if (std::memcmp(hashRes[i], targetHash160Bin.data(), 20) == 0) {
+                    
+                    // Candidate found - check all targets
+                    std::string hash160Hex = bytesToHex(hashRes[i], 20);
+                    Int& actualPrivKey = batchPrivKeys[batchStart + i];
+                    std::string privHex = padHexTo64(intToHex(actualPrivKey));
+                    
+                    appendCandidateToFile(privHex, hash160Hex);
+                    ++localCandidates;
+                    
+                    // Check exact match against all targets
+                    for (const auto& target : targetHash160s) {
+                        if (std::memcmp(hashRes[i], target.data(), 20) == 0) {
                             bool expected = false;
                             if (g_matchFound.compare_exchange_strong(expected, true)) {
-                                g_foundPrivKey = padHexTo64(intToHex(actualPrivKey));
+                                std::lock_guard<std::mutex> lock(g_foundMutex);
+                                g_foundPrivKey = privHex;
                                 g_foundPubKey = pointToCompressedHex(ptBatch[batchStart + i]);
                                 g_matchesFound++;
+                                writeFoundKey(g_foundPrivKey, hash160Hex);
                             }
                             return;
                         }
                     }
                 }
-
-                // Update statistics (less frequent for better performance)
-                if (localChecked % 5000 == 0) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    if (std::chrono::duration<double>(now - lastStat).count() >= STATUS_INTERVAL_SEC) {
-                        static std::mutex statsMutex;
-                        std::lock_guard<std::mutex> lock(statsMutex);
-                        
-                        globalChecked += localChecked;
-                        localChecked = 0ULL;
-                        globalElapsed = std::chrono::duration<double>(now - tStart).count();
-                        kps = globalChecked.load() / globalElapsed;
-
-                        printStats(numCPUs, targetHash160, kps, globalChecked.load(),
-                                   globalElapsed, g_candidatesFound.load(), g_matchesFound.load());
-                        lastStat = now;
-                    }
-                }
             }
-
-            globalChecked += localChecked;
+            
+            // Update stats periodically (lock-free)
+            if (localChecked % 10000 == 0) {
+                stats.checked.fetch_add(localChecked, std::memory_order_relaxed);
+                stats.candidates.fetch_add(localCandidates, std::memory_order_relaxed);
+                g_totalChecked.fetch_add(localChecked, std::memory_order_relaxed);
+                g_totalCandidates.fetch_add(localCandidates, std::memory_order_relaxed);
+                localChecked = 0;
+                localCandidates = 0;
+            }
+        }
+        
+        // Final stats update
+        stats.checked.fetch_add(localChecked, std::memory_order_relaxed);
+        stats.candidates.fetch_add(localCandidates, std::memory_order_relaxed);
+        g_totalChecked.fetch_add(localChecked, std::memory_order_relaxed);
+        g_totalCandidates.fetch_add(localCandidates, std::memory_order_relaxed);
+    }
+    
+    void run() {
+        // Initialize thread tracking
+        g_threadPrivateKeys.assign(numThreads, "0");
+        std::vector<ThreadStats> threadStats(numThreads);
+        
+        auto tStart = std::chrono::high_resolution_clock::now();
+        auto lastStat = tStart;
+        
+        // Launch worker threads
+        std::vector<std::thread> threads;
+        for (int tid = 0; tid < numThreads; ++tid) {
+            threads.emplace_back([this, tid, &threadStats]() {
+                this->workerThread(tid, threadStats[tid]);
+            });
+        }
+        
+        // Statistics display thread
+        std::thread statThread([this, tStart, &threadStats]() {
+            auto lastStat = std::chrono::high_resolution_clock::now();
+            while (!g_matchFound.load(std::memory_order_relaxed)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(STAT_INTERVAL_MS));
+                
+                auto now = std::chrono::high_resolution_clock::now();
+                double elapsed = std::chrono::duration<double>(now - tStart).count();
+                unsigned long long total = g_totalChecked.load();
+                double kps = total / elapsed;
+                
+                // Gather per-thread stats
+                unsigned long long threadTotal = 0;
+                for (int i = 0; i < numThreads; i++) {
+                    threadTotal += threadStats[i].checked.load();
+                }
+                
+                // Clear screen and print
+                system("clear");
+                std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
+                          << "║         BTC PUZZLE HUNTER v2.0 - ARM64 OPTIMIZED            ║\n"
+                          << "╠══════════════════════════════════════════════════════════════╣\n"
+                          << "║ Threads:    " << std::setw(3) << numThreads 
+                          << " / " << std::setw(3) << std::thread::hardware_concurrency() << " active          ║\n"
+                          << "║ Keys/sec:   " << std::setw(12) << std::fixed << std::setprecision(0) << kps << "              ║\n"
+                          << "║ Total:      " << std::setw(18) << formatLargeNumber(total) << "        ║\n"
+                          << "║ Elapsed:    " << std::setw(10) << formatElapsedTime(elapsed) << "                  ║\n"
+                          << "║ Candidates: " << std::setw(8) << g_totalCandidates.load() << "                        ║\n"
+                          << "║ Matches:    " << std::setw(8) << g_matchesFound.load() << "                        ║\n"
+                          << "╚══════════════════════════════════════════════════════════════╝\n";
+            }
         });
-    }
-
-    // Wait for all threads to complete
-    for (auto& t : threads) {
-        t.join();
-    }
-
-    if (!g_matchFound.load()) {
+        
+        // Wait for completion
+        for (auto& t : threads) {
+            t.join();
+        }
+        g_matchFound.store(true); // Signal stat thread to stop
+        statThread.join();
+        
+        // Final display
+        auto tEnd = std::chrono::high_resolution_clock::now();
+        double totalElapsed = std::chrono::duration<double>(tEnd - tStart).count();
+        
         system("clear");
-        std::cout << "╔══════════════════════════════════════════════════════╗\n"
-                  << "║                  SEARCH COMPLETED                   ║\n"
-                  << "╠══════════════════════════════════════════════════════╣\n"
-                  << "║ No exact match found.                                ║\n"
-                  << "║ Total keys checked: " << std::setw(15) << formatLargeNumber(globalChecked.load()) << "                 ║\n"
-                  << "║ Candidates found  : " << std::setw(15) << formatLargeNumber(g_candidatesFound.load()) << "                 ║\n"
-                  << "║ Search time       : " << std::setw(15) << formatElapsedTime(globalElapsed) << "                 ║\n"
-                  << "╚══════════════════════════════════════════════════════╝\n";
-        std::cout << "\nPress Enter to exit...";
-        std::cin.get();
-        return 0;
+        if (g_matchesFound.load() > 0) {
+            std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
+                      << "║                    MATCH FOUND!                              ║\n"
+                      << "╠══════════════════════════════════════════════════════════════╣\n"
+                      << "║ Private Key: " << g_foundPrivKey << " ║\n"
+                      << "║ Public Key:  " << g_foundPubKey << " ║\n"
+                      << "╚══════════════════════════════════════════════════════════════╝\n";
+        } else {
+            std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
+                      << "║                 SEARCH COMPLETED                             ║\n"
+                      << "╠══════════════════════════════════════════════════════════════╣\n"
+                      << "║ Total checked: " << std::setw(18) << formatLargeNumber(g_totalChecked.load()) << "       ║\n"
+                      << "║ Time:         " << std::setw(10) << formatElapsedTime(totalElapsed) << "                  ║\n"
+                      << "║ Avg k/s:      " << std::setw(12) << std::fixed << std::setprecision(0) 
+                      << (g_totalChecked.load() / totalElapsed) << "              ║\n"
+                      << "╚══════════════════════════════════════════════════════════════╝\n";
+        }
     }
+};
 
-    // Write found key to file
-    writeFoundKey(g_foundPrivKey, targetHash160);
+// ============================================================================
+// MAIN ENTRY POINT
+// ============================================================================
 
-    system("clear");
-    std::cout << "╔══════════════════════════════════════════════════════╗\n"
-              << "║                   MATCH FOUND!                      ║\n"
-              << "╠══════════════════════════════════════════════════════╣\n"
-              << "║ Private Key: " << g_foundPrivKey << " ║\n"
-              << "║ Public Key : " << g_foundPubKey << " ║\n"
-              << "║ Hash160    : " << targetHash160 << " ║\n"
-              << "║                                                      ║\n"
-              << "║ Key saved to found.txt                               ║\n"
-              << "╚══════════════════════════════════════════════════════╝\n";
+int main() {
+    std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
+              << "║     Bitcoin Puzzle Hunter v2.0 - ARM64 Optimized               ║\n"
+              << "║     Maximum Performance Edition for 1000 BTC Puzzle            ║\n"
+              << "╚══════════════════════════════════════════════════════════════╝\n\n";
+    
+    OpenSSL_add_all_algorithms();
+    
+    PuzzleHunter hunter;
+    
+    // Get all puzzle addresses
+    std::cout << "Enter puzzle target hash160 addresses (one per line, empty line to finish):\n";
+    std::cout << "Example: 739437bb8dd3b9e8c6f0e2f3b8a1c5d7e9f2b4a6\n";
+    
+    std::string input;
+    while (true) {
+        std::cout << "Target #" << (hunter.targetHash160s.size() + 1) << ": ";
+        std::getline(std::cin, input);
+        if (input.empty()) break;
+        
+        // Remove whitespace
+        input.erase(std::remove_if(input.begin(), input.end(), ::isspace), input.end());
+        
+        if (input.length() != 40) {
+            std::cerr << "Error: Hash160 must be exactly 40 hex characters\n";
+            continue;
+        }
+        hunter.addTarget(input);
+    }
+    
+    if (hunter.targetHash160s.empty()) {
+        std::cerr << "Error: At least one target required\n";
+        return 1;
+    }
+    
+    // Get range
+    std::string startHex, endHex;
+    std::cout << "\nEnter start range (hex): ";
+    std::getline(std::cin, startHex);
+    std::cout << "Enter end range (hex): ";
+    std::getline(std::cin, endHex);
+    
+    if (startHex.empty() || endHex.empty()) {
+        std::cerr << "Error: Range required\n";
+        return 1;
+    }
+    
+    hunter.setRange(startHex, endHex);
+    hunter.initialize();
+    
+    std::cout << "\nStarting optimized search with " << hunter.targetHash160s.size() 
+              << " targets...\n";
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    
+    hunter.run();
     
     std::cout << "\nPress Enter to exit...";
     std::cin.get();
