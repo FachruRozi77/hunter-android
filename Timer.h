@@ -13,7 +13,7 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
-*/
+ */
 
 #ifndef TIMERH
 #define TIMERH
@@ -24,16 +24,16 @@
 class Timer {
 
 public:
-  static void Init();
-  static double get_tick();
-  static void printResult(char *unit, int nbTry, double t0, double t1);
-  static std::string getResult(char *unit, int nbTry, double t0, double t1);
-  static int getCoreNumber();
-  static std::string getSeed(int size);
-  static uint32_t getSeed32();
-  static void SleepMillis(uint32_t millis);
+static void Init();
+static double get_tick();
+static void printResult(char *unit, int nbTry, double t0, double t1);
+static std::string getResult(char *unit, int nbTry, double t0, double t1);
+static int getCoreNumber();
+static std::string getSeed(int size);
+static uint32_t getSeed32();
+static void SleepMillis(uint32_t millis);
 
-  static time_t tickStart;
+static time_t tickStart;
 
 };
 
