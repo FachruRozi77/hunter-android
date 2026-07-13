@@ -55,6 +55,7 @@ void ShiftR64Bit();
 void ShiftL(uint32_t n);
 void ShiftL32Bit();
 void ShiftL64Bit();
+void ShiftL64BitAndSub(Int *a, int n);
 // Bit swap
 void SwapBit(int bitNumber);
 
