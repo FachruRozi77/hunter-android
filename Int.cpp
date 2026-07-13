@@ -19,7 +19,6 @@
 #include "IntGroup.h"
 #include <string.h>
 #include <math.h>
-#include <emmintrin.h>
 #include "Timer.h"
 
 #define MAX(x,y) (((x)>(y))?(x):(y))
@@ -1238,11 +1237,7 @@ std::string Int::GetC64Str(int nbDigit) {
   tmp[1] = 0;
   for (int i = 0; i< nbDigit; i++) {
     if (bits64[i] != 0) {
-#ifdef WIN64
-      sprintf(bStr, "0x%016I64XULL", bits64[i]);
-#else
       sprintf(bStr, "0x%" PRIx64  "ULL", bits64[i]);
-#endif
     } else {
       sprintf(bStr, "0ULL");
     }
@@ -1642,12 +1637,12 @@ void Int::Check() {
   a.Rand(pSize);
   b.Rand(pSize-64);
   t0 = Timer::get_tick();
-  uint64_t c0 = __rdtsc();
+  uint64_t c0 = my_rdtsc();
   for (int i = 0; i < 400000; i++) {
     a.Add(&b);
     a.ModInv();
   }
-  uint64_t c1 = __rdtsc();
+  uint64_t c1 = my_rdtsc();
   t1 = Timer::get_tick();
 
   printf("ModInv() Results OK : ");

@@ -15,52 +15,32 @@
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
 */
 
+// This file targeted Windows (QueryPerformanceCounter/CryptGenRandom/Sleep/
+// GetSystemInfo) as well as POSIX. Since the target here is Android (ARM,
+// Bionic libc, POSIX-compliant), the Windows branch has been removed
+// entirely rather than kept as dead code.
+
 #include "Timer.h"
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cerrno>
+#include <cstring>
+#include <sys/time.h>
+#include <unistd.h>
 
 static const char *prefix[] = { "","Kilo","Mega","Giga","Tera","Peta","Hexa" };
 
-#ifdef WIN64
-
-LARGE_INTEGER Timer::perfTickStart;
-double Timer::perfTicksPerSec;
-LARGE_INTEGER Timer::qwTicksPerSec;
-#include <wincrypt.h>
-
-#else
-
-#include <sys/time.h>
-#include <unistd.h>
-#include <string.h>
 time_t Timer::tickStart;
 
-#endif
-
 void Timer::Init() {
-
-#ifdef WIN64
-  QueryPerformanceFrequency(&qwTicksPerSec);
-  QueryPerformanceCounter(&perfTickStart);
-  perfTicksPerSec = (double)qwTicksPerSec.QuadPart;
-#else
-  tickStart=time(NULL);
-#endif
-
+  tickStart = time(NULL);
 }
 
 double Timer::get_tick() {
-
-#ifdef WIN64
-  LARGE_INTEGER t, dt;
-  QueryPerformanceCounter(&t);
-  dt.QuadPart = t.QuadPart - perfTickStart.QuadPart;
-  return (double)(dt.QuadPart) / perfTicksPerSec;
-#else
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (double)(tv.tv_sec - tickStart) + (double)tv.tv_usec / 1e6;
-#endif
-
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (double)(tv.tv_sec - tickStart) + (double)tv.tv_usec / 1e6;
 }
 
 std::string Timer::getSeed(int size) {
@@ -69,60 +49,18 @@ std::string Timer::getSeed(int size) {
   char tmp[3];
   unsigned char *buff = (unsigned char *)malloc(size);
 
-#ifdef WIN64
-
-  HCRYPTPROV   hCryptProv = NULL;
-  LPCSTR UserName = "KeyContainer";
-
-  if (!CryptAcquireContext(
-    &hCryptProv,               // handle to the CSP
-    UserName,                  // container name
-    NULL,                      // use the default provider
-    PROV_RSA_FULL,             // provider type
-    0))                        // flag values
-  {
-    //-------------------------------------------------------------------
-    // An error occurred in acquiring the context. This could mean
-    // that the key container requested does not exist. In this case,
-    // the function can be called again to attempt to create a new key
-    // container. Error codes are defined in Winerror.h.
-    if (GetLastError() == NTE_BAD_KEYSET) {
-      if (!CryptAcquireContext(
-        &hCryptProv,
-        UserName,
-        NULL,
-        PROV_RSA_FULL,
-        CRYPT_NEWKEYSET)) {
-        printf("CryptAcquireContext(): Could not create a new key container.\n");
-        exit(1);
-      }
-    } else {
-      printf("CryptAcquireContext(): A cryptographic service handle could not be acquired.\n");
-      exit(1);
-    }
-  }
-
-  if (!CryptGenRandom(hCryptProv,size,buff)) {
-    printf("CryptGenRandom(): Error during random sequence acquisition.\n");
-    exit(1);
-  }
-
-  CryptReleaseContext(hCryptProv, 0);
-
-#else
-
+  // /dev/urandom is available in Android/Termux exactly as on any Linux
+  // system, so this is unchanged - it was already correct for ARM.
   FILE *f = fopen("/dev/urandom","rb");
   if(f==NULL) {
     printf("Failed to open /dev/urandom %s\n", strerror( errno ));
     exit(1);
   }
-  if( fread(buff,1,size,f)!=size ) {
+  if( fread(buff,1,size,f)!=(size_t)size ) {
     printf("Failed to read from /dev/urandom %s\n", strerror( errno ));
     exit(1);
   }
   fclose(f);
-
-#endif
 
   for (int i = 0; i < size; i++) {
     sprintf(tmp,"%02X",buff[i]);
@@ -159,24 +97,15 @@ void Timer::printResult(char *unit, int nbTry, double t0, double t1) {
 }
 
 int Timer::getCoreNumber() {
-
-#ifdef WIN64
-  SYSTEM_INFO sysinfo;
-  GetSystemInfo(&sysinfo);
-  return sysinfo.dwNumberOfProcessors;
-#else
-  // TODO
-  return 1;
-#endif
-
+  // The POSIX path used to be an unimplemented "TODO: return 1", which
+  // silently forced every non-Windows build (including this Android build)
+  // onto a single core no matter how many CPUs the phone actually has.
+  // sysconf(_SC_NPROCESSORS_ONLN) is the correct, portable POSIX way to ask
+  // for the number of cores currently online, and it works on Android/Bionic.
+  long n = sysconf(_SC_NPROCESSORS_ONLN);
+  return (n > 0) ? (int)n : 1;
 }
 
 void Timer::SleepMillis(uint32_t millis) {
-
-#ifdef WIN64
-  Sleep(millis);
-#else
   usleep(millis*1000);
-#endif
-
 }

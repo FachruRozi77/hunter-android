@@ -53,11 +53,6 @@ void rk_seed(unsigned long seed, rk_state *state)
 #define UPPER_MASK 0x80000000UL
 #define LOWER_MASK 0x7fffffffUL
 
-#ifdef WIN32
-// Disable "unary minus operator applied to unsigned type, result still unsigned" warning.
-#pragma warning(disable : 4146)
-#endif
-
 /* Slightly optimised reference implementation of the Mersenne Twister */
 inline unsigned long rk_random(rk_state *state)
 {

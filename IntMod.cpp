@@ -16,7 +16,6 @@
 */
 
 #include "Int.h"
-#include <emmintrin.h>
 #include <string.h>
 #include <iostream>
 
@@ -160,55 +159,6 @@ void Int::DivStep62(Int* u,Int* v,int64_t* eta,int* pos,int64_t* uu,int64_t* uv,
   uint64_t u0 = u->bits64[0];
   uint64_t v0 = v->bits64[0];
 
-#if 0
-
-  *uu = 1; *uv = 0;
-  *vu = 0; *vv = 1;
-
-  #define SWAP_ADD(x,y) x+=y;y-=x;
-  #define SWAP_SUB(x,y) x-=y;y+=x;
-
-  // Former divstep62 (using __builtin_ctzll)
-  // Avg: 632 Kinv/s, Avg number of divstep62: 9.83
-
-  bitCount = 62;
-  int64_t nb0;
-  __m128i _u;
-  __m128i _v;
-  _u.m128i_u64[0] = 1;
-  _u.m128i_u64[1] = 0;
-  _v.m128i_u64[0] = 0;
-  _v.m128i_u64[1] = 1;
-
-  while(true) {
-
-    int zeros = TZC(v0 | (UINT64_MAX << bitCount));
-    v0 >>= zeros;
-    _u = _mm_slli_epi64(_u,(int)zeros);
-    bitCount -= zeros;
-
-    if(bitCount <= 0)
-      break;
-
-    nb0 = (v0 + u0) & 0x3;
-    if(nb0 == 0) {
-      _v = _mm_add_epi64(_v,_u);
-      _u = _mm_sub_epi64(_u,_v);
-      SWAP_ADD(v0,u0);
-    } else {
-      _v = _mm_sub_epi64(_v,_u);
-      _u = _mm_add_epi64(_u,_v);
-      SWAP_SUB(v0,u0);
-    }
-
-  }
-  *uu = _u.m128i_u64[0];
-  *uv = _u.m128i_u64[1];
-  *vu = _v.m128i_u64[0];
-  *vv = _v.m128i_u64[1];
-
-#endif
-
 #if 1
 
   #define SWAP(tmp,x,y) tmp = x; x = y; y = tmp;
@@ -243,21 +193,15 @@ void Int::DivStep62(Int* u,Int* v,int64_t* eta,int* pos,int64_t* uu,int64_t* uv,
 
   bitCount = 62;
 
-  __m128i _u;
-  __m128i _v;
-  __m128i _t;
-
-#ifdef WIN64
-  _u.m128i_u64[0] = 1;
-  _u.m128i_u64[1] = 0;
-  _v.m128i_u64[0] = 0;
-  _v.m128i_u64[1] = 1;
-#else
-  ((int64_t *)&_u)[0] = 1;
-  ((int64_t *)&_u)[1] = 0;
-  ((int64_t *)&_v)[0] = 0;
-  ((int64_t *)&_v)[1] = 1;
-#endif
+  // (u_lo,u_hi) and (v_lo,v_hi) are the two rows of the 2x2 transform
+  // matrix. The original code packed each row into an x86 __m128i and used
+  // SSE2 (_mm_slli_epi64/_mm_sub_epi64) to shift/subtract both lanes in one
+  // instruction. That bought nothing but x86 lock-in: it's just two
+  // independent 64-bit lanes, so plain scalar int64_t arithmetic is
+  // portable and, on an out-of-order ARM core, executes the two lanes in
+  // parallel anyway.
+  int64_t u_lo = 1, u_hi = 0;
+  int64_t v_lo = 0, v_hi = 1;
 
   while(true) {
 
@@ -265,7 +209,8 @@ void Int::DivStep62(Int* u,Int* v,int64_t* eta,int* pos,int64_t* uu,int64_t* uv,
     uint64_t zeros = TZC(v0 | 1ULL << bitCount);
     vh >>= zeros;
     v0 >>= zeros;
-    _u = _mm_slli_epi64(_u,(int)zeros);
+    u_lo <<= zeros;
+    u_hi <<= zeros;
     bitCount -= (int)zeros;
 
     if(bitCount <= 0) {
@@ -275,26 +220,22 @@ void Int::DivStep62(Int* u,Int* v,int64_t* eta,int* pos,int64_t* uu,int64_t* uv,
     if( vh < uh ) {
       SWAP(w,uh,vh);
       SWAP(x,u0,v0);
-      SWAP(_t,_u,_v);
+      int64_t rowTmp;
+      SWAP(rowTmp,u_lo,v_lo);
+      SWAP(rowTmp,u_hi,v_hi);
     }
 
     vh -= uh;
     v0 -= u0;
-    _v = _mm_sub_epi64(_v,_u);
+    v_lo -= u_lo;
+    v_hi -= u_hi;
 
   }
 
-#ifdef WIN64
-  *uu = _u.m128i_u64[0];
-  *uv = _u.m128i_u64[1];
-  *vu = _v.m128i_u64[0];
-  *vv = _v.m128i_u64[1];
-#else
-  *uu = ((int64_t *)&_u)[0];
-  *uv = ((int64_t *)&_u)[1];
-  *vu = ((int64_t *)&_v)[0];
-  *vv = ((int64_t *)&_v)[1];
-#endif
+  *uu = u_lo;
+  *uv = u_hi;
+  *vu = v_lo;
+  *vv = v_hi;
 
 #endif
 
@@ -928,16 +869,10 @@ void Int::MontgomeryMult(Int *a, Int *b) {
 
 void Int::ModMulK1(Int *a, Int *b) {
 
-#ifndef WIN64
-#if (__GNUC__ > 7) || (__GNUC__ == 7 && (__GNUC_MINOR__ > 2))
+  // Android NDK toolchains (Clang) are always new enough for this to be a
+  // plain (non-volatile) local; the old GCC<7.3 workaround/WIN64 branch is
+  // no longer needed on ARM/Android.
   unsigned char c;
-#else
-  #warning "GCC lass than 7.3 detected, upgrade gcc to get best perfromance"
-  volatile unsigned char c;
-#endif
-#else
-  unsigned char c;
-#endif
 
 
   uint64_t ah, al;
@@ -1007,16 +942,10 @@ void Int::ModMulK1(Int *a, Int *b) {
 
 void Int::ModMulK1(Int *a) {
 
-#ifndef WIN64
-#if (__GNUC__ > 7) || (__GNUC__ == 7 && (__GNUC_MINOR__ > 2))
+  // Android NDK toolchains (Clang) are always new enough for this to be a
+  // plain (non-volatile) local; the old GCC<7.3 workaround/WIN64 branch is
+  // no longer needed on ARM/Android.
   unsigned char c;
-#else
-  #warning "GCC lass than 7.3 detected, upgrade gcc to get best perfromance"
-  volatile unsigned char c;
-#endif
-#else
-  unsigned char c;
-#endif
 
   uint64_t ah, al;
   uint64_t t[NB64BLOCK];
@@ -1085,16 +1014,10 @@ void Int::ModMulK1(Int *a) {
 
 void Int::ModSquareK1(Int *a) {
 
-#ifndef WIN64
-#if (__GNUC__ > 7) || (__GNUC__ == 7 && (__GNUC_MINOR__ > 2))
+  // Android NDK toolchains (Clang) are always new enough for this to be a
+  // plain (non-volatile) local; the old GCC<7.3 workaround/WIN64 branch is
+  // no longer needed on ARM/Android.
   unsigned char c;
-#else
-  #warning "GCC lass than 7.3 detected, upgrade gcc to get best perfromance"
-  volatile unsigned char c;
-#endif
-#else
-  unsigned char c;
-#endif
 
   uint64_t u10, u11;
   uint64_t t1;

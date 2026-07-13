@@ -1,4 +1,3 @@
-#include <immintrin.h>
 #include "IntGroup.h"
 
 using namespace std;

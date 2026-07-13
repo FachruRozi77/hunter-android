@@ -3,7 +3,6 @@
 #include "Random.h"
 #include <string>
 #include <inttypes.h>
-#include <immintrin.h>
 
 // We need 1 extra block for Knuth div algorithm , Montgomery multiplication and ModInv
 #define BISIZE 256
@@ -194,83 +193,84 @@ private:
 
 // Inline routines
 
-#ifndef WIN64
+// ---------------------------------------------------------------------------
+// Portable 64x64->128 multiply / add-with-carry / sub-with-borrow primitives.
+//
+// The original code implemented these with x86-only inline assembly (mulx/
+// mulq/imulq/divq) or MSVC's <intrin.h> builtins. Neither exists on ARM.
+// Instead we use the compiler's native 128-bit integer type (unsigned
+// __int128 / __int128), which GCC and Clang both support on AArch64 (and
+// everywhere else that has a 64-bit word). On AArch64 this compiles directly
+// to UMULH/MUL for multiplication and ADCS/SBCS-style code for the carry
+// chains, so it is just as fast as the old hand-written x86 asm was on x86 -
+// with the benefit of also working (and being equally efficient) on ARM.
+// ---------------------------------------------------------------------------
 
-// Missing intrinsics
-inline uint64_t _umul128(uint64_t a, uint64_t b, uint64_t *h)
+typedef unsigned __int128 uint128_t;
+typedef __int128          int128_t;
+
+static inline uint64_t _umul128(uint64_t a, uint64_t b, uint64_t *h)
 {
-#if defined(__BMI2__)
-    uint64_t rlo, rhi;
-    __asm__ (
-        "mulx %[B], %[LO], %[HI]"   
-        : [LO]"=r"(rlo), [HI]"=r"(rhi)
-        : "d"(a), [B]"r"(b)
-        : "cc"  
-    );
-    *h = rhi;
-    return rlo;
-#else
-    uint64_t rhi, rlo;
-    __asm__ (
-        "mulq %[B]"
-        : "=d"(rhi), "=a"(rlo)
-        : "a"(a), [B]"r"(b)
-        : "cc"
-    );
-    *h = rhi;
-    return rlo;
-#endif
+  uint128_t r = (uint128_t)a * (uint128_t)b;
+  *h = (uint64_t)(r >> 64);
+  return (uint64_t)r;
 }
 
-
-int64_t inline _mul128(int64_t a, int64_t b, int64_t *h) {
-  uint64_t rhi;
-  uint64_t rlo;
-  __asm__( "imulq  %[b];" :"=d"(rhi),"=a"(rlo) :"1"(a),[b]"rm"(b));
-  *h = rhi;
-  return rlo;  
+static inline int64_t _mul128(int64_t a, int64_t b, int64_t *h)
+{
+  int128_t r = (int128_t)a * (int128_t)b;
+  *h = (int64_t)(r >> 64);
+  return (int64_t)r;
 }
 
 static inline uint64_t _udiv128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t *r)
 {
-    uint64_t q;    
-    uint64_t rem;  
-
-    asm (
-        "divq %4"
-        : "=d"(rem), "=a"(q)
-        : "a"(lo), "d"(hi), "r"(d)
-        : "cc"
-    );
-
-    *r = rem;
-    return q;
+  uint128_t n = ((uint128_t)hi << 64) | (uint128_t)lo;
+  *r = (uint64_t)(n % d);
+  return (uint64_t)(n / d);
 }
 
-static uint64_t inline my_rdtsc() {
-  uint32_t h;
-  uint32_t l;
-  __asm__( "rdtsc;" :"=d"(h),"=a"(l));
-  return (uint64_t)h << 32 | (uint64_t)l;
+// carry/borrow in and out are 0/1
+static inline unsigned char _addcarry_u64(unsigned char carryIn, uint64_t a, uint64_t b, uint64_t *out)
+{
+  uint128_t r = (uint128_t)a + (uint128_t)b + (uint128_t)carryIn;
+  *out = (uint64_t)r;
+  return (unsigned char)(r >> 64);
 }
+
+static inline unsigned char _subborrow_u64(unsigned char borrowIn, uint64_t a, uint64_t b, uint64_t *out)
+{
+  uint128_t r = (uint128_t)a - (uint128_t)b - (uint128_t)borrowIn;
+  *out = (uint64_t)r;
+  // Underflow wraps modulo 2^128: any borrow leaves nonzero high bits.
+  return (unsigned char)((uint64_t)(r >> 64) != 0);
+}
+
+// Fast monotonic cycle-ish counter, used only for optional diagnostics.
+// On AArch64 (Android's ABI) we read the architectural virtual counter
+// register directly instead of x86's RDTSC; elsewhere we fall back to a
+// portable high-resolution clock.
+#if defined(__aarch64__)
+static inline uint64_t my_rdtsc()
+{
+  uint64_t val;
+  __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(val));
+  return val;
+}
+#else
+#include <chrono>
+static inline uint64_t my_rdtsc()
+{
+  return (uint64_t)std::chrono::high_resolution_clock::now().time_since_epoch().count();
+}
+#endif
 
 #define __shiftright128(a,b,n) ((a)>>(n))|((b)<<(64-(n)))
 #define __shiftleft128(a,b,n) ((b)<<(n))|((a)>>(64-(n)))
 
-
-#define _subborrow_u64(a,b,c,d) __builtin_ia32_sbb_u64(a,b,c,(long long unsigned int*)d);
-#define _addcarry_u64(a,b,c,d) __builtin_ia32_addcarryx_u64(a,b,c,(long long unsigned int*)d);
 #define _byteswap_uint64 __builtin_bswap64
 #define LZC(x) __builtin_clzll(x)
 #define TZC(x) __builtin_ctzll(x)
-
-#else
-
-#include <intrin.h>
-#define TZC(x) _tzcnt_u64(x)
-#define LZC(x) _lzcnt_u64(x)
-
-#endif
 
 
 #define LoadI64(i,i64)    \
