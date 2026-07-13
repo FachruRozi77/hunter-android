@@ -38,9 +38,9 @@
 #include "IntGroup.h"
 
 // Configuration constants (optimized for mobile)
-static constexpr int    POINTS_BATCH_SIZE       = 1024;  // Increased for better performance
+static constexpr int    POINTS_BATCH_SIZE       = 256;  // Increased for better performance
 static constexpr int    HASH_BATCH_SIZE         = 8;     // Increased back to 8
-static constexpr double STATUS_INTERVAL_SEC     = 3.0;   // More frequent updates
+static constexpr double STATUS_INTERVAL_SEC     = 30.0;   // More frequent updates
 static constexpr double SAVE_PROGRESS_INTERVAL  = 300.0;
 static constexpr size_t BLOOM_FILTER_SIZE       = 1 << 19; // 512KB 
 static constexpr int    BLOOM_HASHES            = 8;
