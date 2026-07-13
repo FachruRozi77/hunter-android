@@ -16,6 +16,7 @@
 */
 
 #include "SECP256K1.h"
+#include "IntGroup.h"
 #include <string.h>
 
 Secp256K1::Secp256K1() {
@@ -233,6 +234,55 @@ Point Secp256K1::ComputePublicKey(Int *privKey) {
 
   Q.Reduce();
   return Q;
+
+}
+
+void Secp256K1::ComputePublicKeyBatch(Int *privKeys, int count, Point *pubKeys) {
+
+  if (count <= 0) return;
+
+  // Phase 1: accumulate each key's public point via the same windowed-comb
+  // technique as ComputePublicKey(), but stop short of Reduce() - leave
+  // every point in Jacobian form (x,y,z) instead of paying a ModInv() here.
+  for (int k = 0; k < count; k++) {
+    int i = 0;
+    uint8_t b;
+    Point Q;
+    Q.Clear();
+
+    for (i = 0; i < 32; i++) {
+      b = privKeys[k].GetByte(i);
+      if (b) break;
+    }
+    Q = GTable[256 * i + (b - 1)];
+    i++;
+
+    for (; i < 32; i++) {
+      b = privKeys[k].GetByte(i);
+      if (b)
+        Q = Add2(Q, GTable[256 * i + (b - 1)]);
+    }
+
+    pubKeys[k] = Q; // still Jacobian (z generally != 1)
+  }
+
+  // Phase 2: one Montgomery batch inversion across all `count` Z
+  // coordinates at once, instead of `count` separate ModInv() calls.
+  std::vector<Int> zInv(count);
+  for (int k = 0; k < count; k++)
+    zInv[k].Set(&pubKeys[k].z);
+
+  IntGroup grp(count);
+  grp.Set(zInv.data());
+  grp.ModInv();
+  // zInv[k] now holds pubKeys[k].z^-1 (mod P) for every k.
+
+  // Phase 3: convert every point back to affine using its own inverse.
+  for (int k = 0; k < count; k++) {
+    pubKeys[k].x.ModMul(&pubKeys[k].x, &zInv[k]);
+    pubKeys[k].y.ModMul(&pubKeys[k].y, &zInv[k]);
+    pubKeys[k].z.SetInt32(1);
+  }
 
 }
 

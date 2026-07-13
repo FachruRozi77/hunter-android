@@ -478,11 +478,11 @@ int main()
                     g_threadPrivateKeys[tid] = padHexTo64(intToHex(batchPrivKeys[0]));
                 }
 
-                // Compute public keys
+                // Compute public keys - batched: one shared modular
+                // inversion for the whole batch instead of one per key
+                // (see Secp256K1::ComputePublicKeyBatch).
                 ptBatch.resize(POINTS_BATCH_SIZE);
-                for(size_t i = 0; i < POINTS_BATCH_SIZE; i++) {
-                    ptBatch[i] = secp.ComputePublicKey(&batchPrivKeys[i]);
-                }
+                secp.ComputePublicKeyBatch(batchPrivKeys.data(), POINTS_BATCH_SIZE, ptBatch.data());
 
                 // Process points in smaller batches for hashing
                 for (int batchStart = 0; batchStart < POINTS_BATCH_SIZE; batchStart += HASH_BATCH_SIZE) {

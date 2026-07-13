@@ -35,6 +35,23 @@ public:
   ~Secp256K1();
   void Init();
   Point ComputePublicKey(Int *privKey);
+
+  // Batched version: computes `count` public keys at once, deferring the
+  // per-key Jacobian->affine conversion (Point::Reduce(), which is one
+  // ModInv() each) into a single shared Montgomery batch inversion across
+  // the whole set (IntGroup::ModInv(), one ModInv() total). ModInv() is the
+  // most expensive primitive in this codebase (extended binary GCD, ~10-50x
+  // the cost of a modular multiply) so this collapses `count` inversions
+  // per batch down to 1. Results are bit-identical to calling
+  // ComputePublicKey() `count` times - this only changes when/how often
+  // the inversion happens, not the math.
+  //
+  // Caveat: like the rest of this codebase, this assumes none of the
+  // `count` keys land exactly on the point at infinity (Z == 0). That has
+  // probability ~1/order and is not checked for, consistent with the
+  // existing (non-batched) code path.
+  void ComputePublicKeyBatch(Int *privKeys, int count, Point *pubKeys);
+
   Point NextKey(Point &key);
   void Check();
   bool  EC(Point &p);
