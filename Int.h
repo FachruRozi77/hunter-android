@@ -94,13 +94,13 @@ void ModAdd(uint64_t a);
 void ModSub(Int *a);
 void ModSub(Int *a, Int *b);
 void ModSub(uint64_t a);
+void ModNeg();
 void ModMul(Int *a,Int *b);
 void ModMul(Int *a);
 void ModSquare(Int *a);
 void ModCube(Int *a);
 void ModDouble();
 void ModExp(Int *e);
-void ModNeg();
 void ModSqrt();
 bool HasSqrt();
 void imm_umul_asm(const uint64_t* a, uint64_t b, uint64_t* res);
@@ -167,7 +167,6 @@ uint64_t AddCh(Int *a,uint64_t ca,Int* b,uint64_t cb);
 uint64_t AddCh(Int* a,uint64_t ca);
 uint64_t AddC(Int* a);
 void AddAndShift(Int* a,Int* b,uint64_t cH);
-void ShiftL64BitAndSub(Int *a,int n);
 uint64_t Mult(Int *a, uint32_t b);
 int GetLowestBit();
 void CLEAR();
@@ -194,6 +193,21 @@ uint64_t lo, hi;
 __asm__ volatile (
 "mul %x[lo], %x[a], %x[b] \n"
 "umulh %x[hi], %x[a], %x[b] \n"
+: [lo] "=&r" (lo), [hi] "=&r" (hi)
+: [a] "r" (a), [b] "r" (b)
+);
+*h = hi;
+return lo;
+}
+
+//============================================================================
+// 64-bit signed multiply (for imm_imul) - MOVED UP before use
+//============================================================================
+static inline int64_t _mul128(int64_t a, int64_t b, int64_t *h) {
+int64_t lo, hi;
+__asm__ volatile (
+"smulh %x[hi], %x[a], %x[b] \n"
+"mul %x[lo], %x[a], %x[b] \n"
 : [lo] "=&r" (lo), [hi] "=&r" (hi)
 : [a] "r" (a), [b] "r" (b)
 );
@@ -368,14 +382,16 @@ __asm__ volatile (
 // PRFM - Prefetch Memory
 // Prefetches data for future use
 // type: 0=LD (load), 1=ST (store), 2=PLD (keep in cache)
+// FIXED: Cannot use array indexing in asm string, use switch/if instead
 //============================================================================
 static inline void arm64_prfm(const void *addr, int type) {
-const char *prfm_ops[] = {"prfm pldl1keep, [%x[addr]]\n", "prfm pstl1keep, [%x[addr]]\n", "prfm pldl2keep, [%x[addr]]\n"};
-__asm__ volatile (
-prfm_ops[type]
-:
-: [addr] "r" (addr)
-);
+if (type == 0) {
+__asm__ volatile ("prfm pldl1keep, [%x[addr]]\n" : : [addr] "r" (addr));
+} else if (type == 1) {
+__asm__ volatile ("prfm pstl1keep, [%x[addr]]\n" : : [addr] "r" (addr));
+} else {
+__asm__ volatile ("prfm pldl2keep, [%x[addr]]\n" : : [addr] "r" (addr));
+}
 }
 
 //============================================================================
@@ -404,26 +420,26 @@ return val;
 // NEON-optimized Bloom Filter hash computation
 // Uses vectorized FNV-1a hash for 4 parallel hashes
 //============================================================================
-static inline void arm64_neon_hash4(const uint8_t* data, size_t len,
-                                     uint64_t* h1_out, uint64_t* h2_out,
-                                     uint64_t* h3_out, uint64_t* h4_out) {
-    uint64_t h1 = 0xcbf29ce484222325ULL;
-    uint64_t h2 = 0x84222325cbf29ce4ULL;
-    uint64_t h3 = 0x9e3779b97f4a7c15ULL;
-    uint64_t h4 = 0xf4a7c159e3779b97ULL;
-    
-    for (size_t i = 0; i < len; i++) {
-        uint8_t b = data[i];
-        h1 ^= b; h1 *= 0x100000001b3ULL;
-        h2 ^= (b + 0x9e3779b9); h2 = (h2 << 13) | (h2 >> 51); h2 *= 0x100000001b3ULL;
-        h3 ^= (b * 0x85ebca6b); h3 = (h3 << 17) | (h3 >> 47); h3 *= 0xc2b2ae35;
-        h4 ^= (b + 0x27d4eb2f); h4 = (h4 << 19) | (h4 >> 45); h4 *= 0x165667b1;
-    }
-    
-    *h1_out = h1;
-    *h2_out = h2;
-    *h3_out = h3;
-    *h4_out = h4;
+static inline void arm64_neon_hash4(const uint8_t* data, size_t len,\
+uint64_t* h1_out, uint64_t* h2_out,\
+uint64_t* h3_out, uint64_t* h4_out) {
+uint64_t h1 = 0xcbf29ce484222325ULL;
+uint64_t h2 = 0x84222325cbf29ce4ULL;
+uint64_t h3 = 0x9e3779b97f4a7c15ULL;
+uint64_t h4 = 0xf4a7c159e3779b97ULL;
+
+for (size_t i = 0; i < len; i++) {
+uint8_t b = data[i];
+h1 ^= b; h1 *= 0x100000001b3ULL;
+h2 ^= (b + 0x9e3779b9); h2 = (h2 << 13) | (h2 >> 51); h2 *= 0x100000001b3ULL;
+h3 ^= (b * 0x85ebca6b); h3 = (h3 << 17) | (h3 >> 47); h3 *= 0xc2b2ae35;
+h4 ^= (b + 0x27d4eb2f); h4 = (h4 << 19) | (h4 >> 45); h4 *= 0x165667b1;
+}
+
+*h1_out = h1;
+*h2_out = h2;
+*h3_out = h3;
+*h4_out = h4;
 }
 
 #else // Fallback for non-ARM64
@@ -433,6 +449,13 @@ typedef unsigned __int128 uint128_t;
 uint128_t r = (uint128_t)a * (uint128_t)b;
 *h = (uint64_t)(r >> 64);
 return (uint64_t)r;
+}
+
+static inline int64_t _mul128(int64_t a, int64_t b, int64_t *h) {
+typedef __int128 int128_t;
+int128_t r = (int128_t)a * (int128_t)b;
+*h = (int64_t)(r >> 64);
+return (int64_t)r;
 }
 
 static inline unsigned char _addcarry_u64(unsigned char cin, uint64_t a, uint64_t b, uint64_t *out) {
@@ -481,26 +504,26 @@ static inline uint64_t arm64_ror(uint64_t val, uint64_t amt) {
 return (val >> amt) | (val << (64 - amt));
 }
 
-static inline void arm64_neon_hash4(const uint8_t* data, size_t len,
-                                     uint64_t* h1_out, uint64_t* h2_out,
-                                     uint64_t* h3_out, uint64_t* h4_out) {
-    uint64_t h1 = 0xcbf29ce484222325ULL;
-    uint64_t h2 = 0x84222325cbf29ce4ULL;
-    uint64_t h3 = 0x9e3779b97f4a7c15ULL;
-    uint64_t h4 = 0xf4a7c159e3779b97ULL;
-    
-    for (size_t i = 0; i < len; i++) {
-        uint8_t b = data[i];
-        h1 ^= b; h1 *= 0x100000001b3ULL;
-        h2 ^= (b + 0x9e3779b9); h2 = (h2 << 13) | (h2 >> 51); h2 *= 0x100000001b3ULL;
-        h3 ^= (b * 0x85ebca6b); h3 = (h3 << 17) | (h3 >> 47); h3 *= 0xc2b2ae35;
-        h4 ^= (b + 0x27d4eb2f); h4 = (h4 << 19) | (h4 >> 45); h4 *= 0x165667b1;
-    }
-    
-    *h1_out = h1;
-    *h2_out = h2;
-    *h3_out = h3;
-    *h4_out = h4;
+static inline void arm64_neon_hash4(const uint8_t* data, size_t len,\
+uint64_t* h1_out, uint64_t* h2_out,\
+uint64_t* h3_out, uint64_t* h4_out) {
+uint64_t h1 = 0xcbf29ce484222325ULL;
+uint64_t h2 = 0x84222325cbf29ce4ULL;
+uint64_t h3 = 0x9e3779b97f4a7c15ULL;
+uint64_t h4 = 0xf4a7c159e3779b97ULL;
+
+for (size_t i = 0; i < len; i++) {
+uint8_t b = data[i];
+h1 ^= b; h1 *= 0x100000001b3ULL;
+h2 ^= (b + 0x9e3779b9); h2 = (h2 << 13) | (h2 >> 51); h2 *= 0x100000001b3ULL;
+h3 ^= (b * 0x85ebca6b); h3 = (h3 << 17) | (h3 >> 47); h3 *= 0xc2b2ae35;
+h4 ^= (b + 0x27d4eb2f); h4 = (h4 << 19) | (h4 >> 45); h4 *= 0x165667b1;
+}
+
+*h1_out = h1;
+*h2_out = h2;
+*h3_out = h3;
+*h4_out = h4;
 }
 
 #endif // __aarch64__
@@ -566,11 +589,13 @@ dst[5] = _madd128(x[5], y, carry, &h); carry = h;
 dst[6] = _madd128(x[6], y, carry, &h); carry = h;
 dst[7] = _madd128(x[7], y, carry, &h); carry = h;
 #endif
-// Last word uses signed multiply
+// Last word: use signed multiply with proper type casting
 int64_t sh;
-int64_t slo = (int64_t)_mul128((int64_t)x[NB64BLOCK - 1], (int64_t)y, &sh);
-dst[NB64BLOCK - 1] = _madd128((uint64_t)slo, 1, carry, &h);
-*carryH = h + (uint64_t)sh;
+int64_t slo = _mul128((int64_t)x[NB64BLOCK - 1], (int64_t)y, &sh);
+// Use _umul128 for the final add to avoid type issues, or cast properly
+uint64_t final_carry;
+dst[NB64BLOCK - 1] = _madd128((uint64_t)slo, 1ULL, carry, &final_carry);
+*carryH = final_carry + (uint64_t)sh;
 }
 
 #else // Non-ARM64 fallback
@@ -605,7 +630,7 @@ c = _addcarry_u64(c, _umul128(x[5], y, &h), carry, dst + 5); carry = h;
 c = _addcarry_u64(c, _umul128(x[6], y, &h), carry, dst + 6); carry = h;
 c = _addcarry_u64(c, _umul128(x[7], y, &h), carry, dst + 7); carry = h;
 #endif
-c = _addcarry_u64(c, _mul128((int64_t)x[NB64BLOCK - 1], (int64_t)y, (int64_t*)&h), carry, dst + NB64BLOCK - 1); carry = h;
+c = _addcarry_u64(c, (uint64_t)_mul128((int64_t)x[NB64BLOCK - 1], (int64_t)y, (int64_t*)&h), carry, dst + NB64BLOCK - 1); carry = h;
 *carryH = carry;
 }
 
@@ -651,7 +676,7 @@ c = _addcarry_u64(c, _umul128(x[5], y, &h), carry, dst + 5); carry = h;
 c = _addcarry_u64(c, _umul128(x[6], y, &h), carry, dst + 6); carry = h;
 c = _addcarry_u64(c, _umul128(x[7], y, &h), carry, dst + 7); carry = h;
 #endif
-c = _addcarry_u64(c, _mul128((int64_t)x[NB64BLOCK - 1], (int64_t)y, (int64_t*)&h), carry, dst + NB64BLOCK - 1); carry = h;
+c = _addcarry_u64(c, (uint64_t)_mul128((int64_t)x[NB64BLOCK - 1], (int64_t)y, (int64_t*)&h), carry, dst + NB64BLOCK - 1); carry = h;
 *carryH = carry;
 #endif
 }
@@ -691,7 +716,7 @@ __asm__ volatile (
 "bfi %x[d3], %x[d4], #32, #32 \n"
 "lsr %x[d4], %x[d4], #32 \n"
 : [d0] "+r" (d[0]), [d1] "+r" (d[1]), [d2] "+r" (d[2]),
-  [d3] "+r" (d[3]), [d4] "+r" (d[4])
+[d3] "+r" (d[3]), [d4] "+r" (d[4])
 );
 } else
 #endif
@@ -745,28 +770,6 @@ return 0;
 }
 
 //============================================================================
-// 64-bit signed multiply (for imm_imul)
-//============================================================================
-static inline int64_t _mul128(int64_t a, int64_t b, int64_t *h) {
-#if defined(__aarch64__)
-int64_t lo, hi;
-__asm__ volatile (
-"smulh %x[hi], %x[a], %x[b] \n"
-"mul %x[lo], %x[a], %x[b] \n"
-: [lo] "=&r" (lo), [hi] "=&r" (hi)
-: [a] "r" (a), [b] "r" (b)
-);
-*h = hi;
-return lo;
-#else
-typedef __int128 int128_t;
-int128_t r = (int128_t)a * (int128_t)b;
-*h = (int64_t)(r >> 64);
-return (int64_t)r;
-#endif
-}
-
-//============================================================================
 // Byte swap using ARM64 REV instruction
 //============================================================================
 #if defined(__aarch64__)
@@ -783,11 +786,11 @@ return r;
 #define TZC(x) __builtin_ctzll(x)
 #endif
 
-#define LoadI64(i,i64) \
-i.bits64[0] = i64; \
-i.bits64[1] = i64 >> 63; \
-i.bits64[2] = i.bits64[1];\\
-i.bits64[3] = i.bits64[1];\\
-i.bits64[4] = i.bits64[1];
+#define LoadI64(i,i64) \\
+i.bits64[0] = i64; \\
+i.bits64[1] = i64 >> 63; \\
+i.bits64[2] = i.bits64[1];\\\
+i.bits64[3] = i.bits64[1];\\\
+i.bits64[4] = i.bits64[1];\\
 
 #endif // BIGINTH
