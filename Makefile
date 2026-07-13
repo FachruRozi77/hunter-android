@@ -5,7 +5,7 @@ CXX = clang++
 
 # ARM64 Ultimate Optimization Flags
 # -march=armv8-a+crc+crypto+sha2: Enable ALL ARM64 crypto extensions including SHA-256
-# -mfpu=neon: Enable NEON SIMD
+# NEON is implicit on AArch64, no -mfpu needed
 # -O3: Maximum optimization
 # -flto: Link-time optimization
 # -fomit-frame-pointer: Free up a register
@@ -15,11 +15,11 @@ CXX = clang++
 # -D__ARM_FEATURE_CRYPTO: Enable crypto extensions
 
 CXXFLAGS = -O3 -flto -fomit-frame-pointer -funroll-loops \
-    -march=armv8-a+crc+crypto+sha2 -mtune=cortex-a76 \
-    -mfpu=neon -DNDEBUG -Wall -Wextra \
-    -D__ARM_FEATURE_SHA2 -D__ARM_FEATURE_CRYPTO \
-    -ftree-vectorize -fopt-info-vec-optimized \
-    -ffast-math -funsafe-math-optimizations
+	-march=armv8-a+crc+crypto+sha2 -mtune=cortex-a76 \
+	-DNDEBUG -Wall -Wextra \
+	-D__ARM_FEATURE_SHA2 -D__ARM_FEATURE_CRYPTO \
+	-ftree-vectorize \
+	-ffast-math -funsafe-math-optimizations
 
 # For even more aggressive optimization (use with caution):
 # CXXFLAGS += -fipa-pta -fdevirtualize-at-ltrans -floop-nest-optimize
@@ -31,7 +31,7 @@ LDFLAGS = -lpthread -lcrypto -lssl -lm
 
 # Source files
 SRCS = hunter-android.cpp Int.cpp IntMod.cpp IntGroup.cpp Point.cpp \
-    Random.cpp SECP256K1.cpp Timer.cpp
+	Random.cpp SECP256K1.cpp Timer.cpp
 
 OBJS = $(SRCS:.cpp=.o)
 TARGET = btc-puzzle-hunter-arm64
@@ -58,10 +58,10 @@ $(TARGET): $(OBJS)
 	$(CXX) $(CXXFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Build complete: $(TARGET)"
 	@echo "ARM64 optimizations enabled:"
-	@echo "  - Scalar: MUL, UMULH, MADD, MSUB, ADC, SBC, CSEL, CSINC, CSET"
-	@echo "  - Memory: LDP, STP, PRFM"
-	@echo "  - Crypto: SHA256H, SHA256H2, SHA256SU0, SHA256SU1"
-	@echo "  - SIMD: NEON for Bloom Filter, Hash160 batches, Hex conversion"
+	@echo " - Scalar: MUL, UMULH, MADD, MSUB, ADC, SBC, CSEL, CSINC, CSET"
+	@echo " - Memory: LDP, STP, PRFM"
+	@echo " - Crypto: SHA256H, SHA256H2, SHA256SU0, SHA256SU1"
+	@echo " - SIMD: NEON for Bloom Filter, Hash160 batches, Hex conversion"
 
 %.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
