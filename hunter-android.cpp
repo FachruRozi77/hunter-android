@@ -25,6 +25,9 @@
 #include <csignal>
 #include <cstdlib>
 #include <regex>
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <sched.h>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -153,10 +156,17 @@ static void setThreadAffinity(int core_id) {
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core_id, &cpuset);
+    // Try pthread_setaffinity_np first (GNU extension)
+    #ifdef __ANDROID__
+    // Android Bionic uses sched_setaffinity
+    pid_t tid = gettid();
+    int rc = sched_setaffinity(tid, sizeof(cpu_set_t), &cpuset);
+    #else
     pthread_t current_thread = pthread_self();
     int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    #endif
     if (rc != 0) {
-        std::cerr << "[WARN] Failed to set thread affinity to core " << core_id << "\n";
+        // Silently ignore - affinity is optimization, not required
     }
 }
 
@@ -601,8 +611,9 @@ public:
                 double elapsed = std::chrono::duration<double>(now - tStart).count();
                 unsigned long long total = g_totalChecked.load();
                 double kps = total / elapsed;
-                unsigned long long threadTotal = 0;
-                for (int i = 0; i < numThreads; i++) threadTotal += threadStats[i].checked.load();
+                // Per-thread stats available if needed for debugging
+                // unsigned long long threadTotal = 0;
+                // for (int i = 0; i < numThreads; i++) threadTotal += threadStats[i].checked.load();
                 std::string thermalStatus = g_thermalPaused.load() ? " [THERMAL PAUSE]" : "";
                 std::string memUsage = getMemoryUsage();
 
