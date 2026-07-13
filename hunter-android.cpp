@@ -431,7 +431,7 @@ int main()
 
     // Initialize threading (limit for mobile)
     int numCPUs = std::thread::hardware_concurrency();
-    if (numCPUs > 6) numCPUs = 6; // Limit threads on mobile to prevent overheating
+    if (numCPUs > 6) numCPUs = 7; // Limit threads on mobile to prevent overheating
     g_threadPrivateKeys.assign(numCPUs, "0");
 
     std::atomic<unsigned long long> globalChecked{0};
