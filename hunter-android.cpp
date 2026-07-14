@@ -695,7 +695,7 @@ hasher.compute(&pubBin, &hash160, 1);
 std::string hash160Hex = bytesToHex(hash160, 20);
 
 // Expected Hash160 for priv=1 (1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH)
-const char* expectedHash160 = "91b24bf9f5288532960ac687abb035127b1d28a5";
+const char* expectedHash160 = "751e76e8199196d454941c45d1b3a323f1433bd6";
 if (hash160Hex != expectedHash160) {
 std::cout << "[FAIL] Test 4: Hash160 for priv=1\n";
 std::cout << "  Expected: " << expectedHash160 << "\n";
