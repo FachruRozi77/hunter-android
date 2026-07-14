@@ -1,3 +1,4 @@
+
 //============================================================================
 // BTC PUZZLE HUNTER v5.1 - DEBUG EDITION
 // Added debug printing for private key, public key, and Hash160 tracing
@@ -72,7 +73,7 @@ static std::ofstream g_debugLog;
 static void initDebugLog() {
     g_debugLog.open("hunter_debug.txt", std::ios::trunc);
     if (!g_debugLog) {
-        std::cerr << "[WARN] Cannot open debug log\\n";
+        std::cerr << "[WARN] Cannot open debug log\n";
     }
 }
 
@@ -81,7 +82,7 @@ static void debugLog(const std::string& msg) {
     if (g_debugLog) {
         auto now = std::chrono::system_clock::now();
         auto t = std::chrono::system_clock::to_time_t(now);
-        g_debugLog << std::put_time(std::localtime(&t), "%H:%M:%S") << " " << msg << "\\n";
+        g_debugLog << std::put_time(std::localtime(&t), "%H:%M:%S") << " " << msg << "\n";
         g_debugLog.flush();
     }
 }
@@ -93,7 +94,7 @@ static void debugLog(const std::string& msg) {
 static std::atomic<bool> g_shutdownRequested{false};
 
 static void signalHandler(int sig) {
-    std::cerr << "\\n[SIGNAL] Caught signal " << sig << ", shutting down gracefully...\\n";
+    std::cerr << "\n[SIGNAL] Caught signal " << sig << ", shutting down gracefully...\n";
     g_shutdownRequested.store(true);
 }
 
@@ -114,14 +115,14 @@ struct CliArgs {
 };
 
 static void printUsage(const char* progName) {
-    std::cout << "Usage: " << progName << " [OPTIONS]\\n\\n"
-              << "Options:\\n"
-              << "  -r START:END   Search range in hex\\n"
-              << "  -h160 HASH     Target Hash160 (40 hex chars). Repeatable.\\n"
-              << "  -maxtemp TEMP  Max CPU temp in Celsius (default: " << DEFAULT_MAX_TEMP << ")\\n"
-              << "  -stat MS       Status refresh interval ms (default: " << DEFAULT_STAT_INTERVAL_MS << ")\\n"
-              << "  -test          Run deterministic self-test\\n"
-              << "  -h, --help     Show this help\\n";
+    std::cout << "Usage: " << progName << " [OPTIONS]\n\n"
+              << "Options:\n"
+              << "  -r START:END   Search range in hex\n"
+              << "  -h160 HASH     Target Hash160 (40 hex chars). Repeatable.\n"
+              << "  -maxtemp TEMP  Max CPU temp in Celsius (default: " << DEFAULT_MAX_TEMP << ")\n"
+              << "  -stat MS       Status refresh interval ms (default: " << DEFAULT_STAT_INTERVAL_MS << ")\n"
+              << "  -test          Run deterministic self-test\n"
+              << "  -h, --help     Show this help\n";
 }
 
 static CliArgs parseArgs(int argc, char* argv[]) {
@@ -132,7 +133,7 @@ static CliArgs parseArgs(int argc, char* argv[]) {
         else if (arg == "-test") { args.selfTest = true; return args; }
         else if (arg == "-r" && i + 1 < argc) {
             std::string range = argv[++i];
-            size_t colonPos = range.find(\':\');
+            size_t colonPos = range.find(':');
             if (colonPos == std::string::npos) {
                 args.valid = false; args.errorMsg = "Invalid range format. Use START:END"; return args;
             }
@@ -252,16 +253,16 @@ public:
                 if (currentTemp >= 0) {
                     if (currentTemp >= maxTemp && !paused.load()) {
                         paused.store(true);
-                        std::cout << "\\n[THERMAL] CPU temp " << currentTemp
+                        std::cout << "\n[THERMAL] CPU temp " << currentTemp
                                   << "C (max " << maxTemp << "C). Pausing "
-                                  << THERMAL_PAUSE_MINUTES << " min...\\n";
+                                  << THERMAL_PAUSE_MINUTES << " min...\n";
                         auto pauseStart = std::chrono::steady_clock::now();
                         while (paused.load() && running.load()) {
                             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                                 std::chrono::steady_clock::now() - pauseStart).count();
                             if (elapsed >= THERMAL_PAUSE_MINUTES * 60) {
                                 paused.store(false);
-                                std::cout << "[THERMAL] Resume.\\n";
+                                std::cout << "[THERMAL] Resume.\n";
                                 break;
                             }
                             std::this_thread::sleep_for(std::chrono::seconds(5));
@@ -269,7 +270,7 @@ public:
                             if (newTemp >= 0 && newTemp < maxTemp - 5) {
                                 paused.store(false);
                                 std::cout << "[THERMAL] Temp dropped to " << newTemp
-                                          << "C. Resuming early...\\n";
+                                          << "C. Resuming early...\n";
                                 break;
                             }
                         }
@@ -441,7 +442,7 @@ static inline std::string bytesToHex(const uint8_t* data, size_t len) {
 }
 
 static inline std::string padHexTo64(const std::string& h) {
-    return (h.size() >= 64) ? h : std::string(64 - h.size(), \'0\') + h;
+    return (h.size() >= 64) ? h : std::string(64 - h.size(), '0') + h;
 }
 
 static inline Int hexToInt(const std::string& h) {
@@ -455,7 +456,7 @@ static inline std::string intToHex(const Int& v) {
 
 static inline std::string intXToHex64(const Int& x) {
     Int t; t.Set((Int*)&x); std::string h = t.GetBase16();
-    if (h.size() < 64) h.insert(0, 64 - h.size(), \'0\'); return h;
+    if (h.size() < 64) h.insert(0, 64 - h.size(), '0'); return h;
 }
 
 static inline bool isEven(const Int& n) { return n.IsEven(); }
@@ -472,21 +473,21 @@ static inline void pointToCompressedBin(const Point& p, uint8_t out[33]) {
 
 static void writeFoundKey(const std::string& privHex, const std::string& hash160Hex) {
     std::ofstream ofs("found.txt", std::ios::app);
-    if (!ofs) { std::cerr << "Cannot open found.txt\\n"; return; }
-    ofs << "Hash160: " << hash160Hex << "\\nPrivate Key: " << privHex << "\\n\\n"; ofs.flush();
+    if (!ofs) { std::cerr << "Cannot open found.txt\n"; return; }
+    ofs << "Hash160: " << hash160Hex << "\nPrivate Key: " << privHex << "\n\n"; ofs.flush();
 }
 
 static void appendCandidateToFile(const std::string& privHex, const std::string& hash160Hex) {
     static std::mutex candidatesMutex;
     std::lock_guard<std::mutex> lock(candidatesMutex);
     std::ofstream ofs("candidates.txt", std::ios::app);
-    if (ofs) { ofs << "Private Key: " << privHex << "\\nHash160: " << hash160Hex << "\\n\\n"; ofs.flush(); }
+    if (ofs) { ofs << "Private Key: " << privHex << "\nHash160: " << hash160Hex << "\n\n"; ofs.flush(); }
 }
 
 static std::string formatElapsedTime(double sec) {
     int h = int(sec) / 3600, m = (int(sec) % 3600) / 60, s = int(sec) % 60;
     std::ostringstream oss;
-    oss << std::setw(2) << std::setfill(\'0\') << h << ":" << std::setw(2) << m << ":" << std::setw(2) << s;
+    oss << std::setw(2) << std::setfill('0') << h << ":" << std::setw(2) << m << ":" << std::setw(2) << s;
     return oss.str();
 }
 
@@ -533,7 +534,7 @@ static inline void generateRandomIntInRange(const Int& start, const Int& rangeSi
 
     // Slow path: fill all blocks properly with random data
     result.SetInt32(0);
-    
+
     for (int i = 0; i < NB64BLOCK; i++) {
         uint64_t r = rng.next();
         Int chunk;
@@ -548,7 +549,7 @@ static inline void generateRandomIntInRange(const Int& start, const Int& rangeSi
     Int rangeCopy;
     rangeCopy.Set((Int*)&rangeSize);
     result.Mod(&rangeCopy);
-    
+
     Int startCopy;
     startCopy.Set((Int*)&start);
     result.Add(&startCopy);
@@ -574,9 +575,9 @@ static std::string getMemoryUsage() {
 //============================================================================
 
 static bool runSelfTest(Secp256K1& secp) {
-    std::cout << "\\n+==============================================================+\\n";
-    std::cout << "| DETERMINISTIC SELF-TEST - Verifying ECC arithmetic           |\\n";
-    std::cout << "+==============================================================+\\n";
+    std::cout << "\n+==============================================================+\n";
+    std::cout << "| DETERMINISTIC SELF-TEST - Verifying ECC arithmetic           |\n";
+    std::cout << "+==============================================================+\n";
 
     debugLog("Starting deterministic self-test");
     bool allPassed = true;
@@ -589,13 +590,13 @@ static bool runSelfTest(Secp256K1& secp) {
         std::string pub1Hex = pointToCompressedHex(pub1);
         const char* expected1 = "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798";
         if (pub1Hex != expected1) {
-            std::cout << "[FAIL] Test 1: priv=1\\n";
-            std::cout << " Expected: " << expected1 << "\\n";
-            std::cout << " Got:      " << pub1Hex << "\\n";
+            std::cout << "[FAIL] Test 1: priv=1\n";
+            std::cout << " Expected: " << expected1 << "\n";
+            std::cout << " Got:      " << pub1Hex << "\n";
             debugLog("FAIL: priv=1 expected " + std::string(expected1) + " got " + pub1Hex);
             allPassed = false;
         } else {
-            std::cout << "[PASS] Test 1: priv=1 -> correct pubkey\\n";
+            std::cout << "[PASS] Test 1: priv=1 -> correct pubkey\n";
         }
     }
 
@@ -607,13 +608,13 @@ static bool runSelfTest(Secp256K1& secp) {
         std::string pub2Hex = pointToCompressedHex(pub2);
         const char* expected2 = "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5";
         if (pub2Hex != expected2) {
-            std::cout << "[FAIL] Test 2: priv=2\\n";
-            std::cout << " Expected: " << expected2 << "\\n";
-            std::cout << " Got:      " << pub2Hex << "\\n";
+            std::cout << "[FAIL] Test 2: priv=2\n";
+            std::cout << " Expected: " << expected2 << "\n";
+            std::cout << " Got:      " << pub2Hex << "\n";
             debugLog("FAIL: priv=2 expected " + std::string(expected2) + " got " + pub2Hex);
             allPassed = false;
         } else {
-            std::cout << "[PASS] Test 2: priv=2 -> correct pubkey\\n";
+            std::cout << "[PASS] Test 2: priv=2 -> correct pubkey\n";
         }
     }
 
@@ -632,16 +633,16 @@ static bool runSelfTest(Secp256K1& secp) {
             std::string singleHex = pointToCompressedHex(singlePubs[i]);
             std::string batchHex = pointToCompressedHex(batchPubs[i]);
             if (singleHex != batchHex) {
-                std::cout << "[FAIL] Test 3: Batch mismatch at index " << i << "\\n";
-                std::cout << " Single: " << singleHex << "\\n";
-                std::cout << " Batch:  " << batchHex << "\\n";
+                std::cout << "[FAIL] Test 3: Batch mismatch at index " << i << "\n";
+                std::cout << " Single: " << singleHex << "\n";
+                std::cout << " Batch:  " << batchHex << "\n";
                 debugLog("FAIL: batch mismatch at index " + std::to_string(i));
                 batchOk = false;
                 allPassed = false;
             }
         }
         if (batchOk) {
-            std::cout << "[PASS] Test 3: Batch computation matches single computation\\n";
+            std::cout << "[PASS] Test 3: Batch computation matches single computation\n";
         }
     }
 
@@ -660,13 +661,13 @@ static bool runSelfTest(Secp256K1& secp) {
 
         const char* expectedHash160 = "751e76e8199196d454941c45d1b3a323f1433bd6";
         if (hash160Hex != expectedHash160) {
-            std::cout << "[FAIL] Test 4: Hash160 for priv=1\\n";
-            std::cout << " Expected: " << expectedHash160 << "\\n";
-            std::cout << " Got:      " << hash160Hex << "\\n";
+            std::cout << "[FAIL] Test 4: Hash160 for priv=1\n";
+            std::cout << " Expected: " << expectedHash160 << "\n";
+            std::cout << " Got:      " << hash160Hex << "\n";
             debugLog("FAIL: Hash160 expected " + std::string(expectedHash160) + " got " + hash160Hex);
             allPassed = false;
         } else {
-            std::cout << "[PASS] Test 4: Hash160 for priv=1 correct\\n";
+            std::cout << "[PASS] Test 4: Hash160 for priv=1 correct\n";
         }
     }
 
@@ -681,13 +682,13 @@ static bool runSelfTest(Secp256K1& secp) {
         Int product;
         product.ModMul(&testVal, &original);
         if (!product.IsOne()) {
-            std::cout << "[FAIL] Test 5: ModInv(42)\\n";
+            std::cout << "[FAIL] Test 5: ModInv(42)\n";
             debugLog("FAIL: ModInv test failed");
             modInvOk = false;
             allPassed = false;
         }
         if (modInvOk) {
-            std::cout << "[PASS] Test 5: ModInv arithmetic correct\\n";
+            std::cout << "[PASS] Test 5: ModInv arithmetic correct\n";
         }
     }
 
@@ -709,22 +710,22 @@ static bool runSelfTest(Secp256K1& secp) {
         std::string sumHex = pointToCompressedHex(sum);
         std::string pub3Hex = pointToCompressedHex(pub3);
         if (sumHex != pub3Hex) {
-            std::cout << "[FAIL] Test 6: Point addition\\n";
+            std::cout << "[FAIL] Test 6: Point addition\n";
             debugLog("FAIL: Point addition test failed");
             allPassed = false;
         } else {
-            std::cout << "[PASS] Test 6: Point addition consistent\\n";
+            std::cout << "[PASS] Test 6: Point addition consistent\n";
         }
     }
 
-    std::cout << "+==============================================================+\\n";
+    std::cout << "+==============================================================+\n";
     if (allPassed) {
-        std::cout << "| ALL SELF-TESTS PASSED - ECC arithmetic is correct            |\\n";
+        std::cout << "| ALL SELF-TESTS PASSED - ECC arithmetic is correct            |\n";
     } else {
-        std::cout << "| SELF-TEST FAILED - ECC arithmetic has bugs!                  |\\n";
-        std::cout << "| Do NOT run puzzle search until fixed.                        |\\n";
+        std::cout << "| SELF-TEST FAILED - ECC arithmetic has bugs!                  |\n";
+        std::cout << "| Do NOT run puzzle search until fixed.                        |\n";
     }
-    std::cout << "+==============================================================+\\n\\n";
+    std::cout << "+==============================================================+\n\n";
 
     debugLog("Self-test completed: " + std::string(allPassed ? "PASSED" : "FAILED"));
     return allPassed;
@@ -782,10 +783,10 @@ public:
         // DEBUG: Print range info once per thread
         {
             std::lock_guard<std::mutex> lock(g_debugMutex);
-            std::cout << "[DEBUG] Thread " << tid << " starting\\n";
-            std::cout << "[DEBUG] Range start: " << intToHex(startRange) << "\\n";
-            std::cout << "[DEBUG] Range end:   " << intToHex(endRange) << "\\n";
-            std::cout << "[DEBUG] Range size:  " << intToHex(rangeSize) << "\\n";
+            std::cout << "[DEBUG] Thread " << tid << " starting\n";
+            std::cout << "[DEBUG] Range start: " << intToHex(startRange) << "\n";
+            std::cout << "[DEBUG] Range end:   " << intToHex(endRange) << "\n";
+            std::cout << "[DEBUG] Range size:  " << intToHex(rangeSize) << "\n";
             std::cout.flush();
         }
 
@@ -807,10 +808,10 @@ public:
             int printCount = g_debugPrintCount.fetch_add(1);
             if (printCount < MAX_DEBUG_PRINTS) {
                 std::lock_guard<std::mutex> lock(g_debugMutex);
-                std::cout << "\\n[DEBUG] Batch " << printCount << " samples:\\n";
+                std::cout << "\n[DEBUG] Batch " << printCount << " samples:\n";
                 for (int s = 0; s < std::min(3, POINTS_BATCH_SIZE); s++) {
                     std::string privHex = padHexTo64(intToHex(batchPrivKeys[s]));
-                    std::cout << "  priv[" << s << "]: " << privHex << "\\n";
+                    std::cout << "  priv[" << s << "]: " << privHex << "\n";
                 }
                 std::cout.flush();
             }
@@ -837,15 +838,15 @@ public:
                         std::string privHex = padHexTo64(intToHex(batchPrivKeys[batchStart + i]));
 
                         std::lock_guard<std::mutex> lock(g_debugMutex);
-                        std::cout << "[DEBUG] Key " << i << ":\\n";
-                        std::cout << "  priv:    " << privHex << "\\n";
-                        std::cout << "  pubkey:  " << pubHex << "\\n";
-                        std::cout << "  hash160: " << hash160Hex << "\\n";
+                        std::cout << "[DEBUG] Key " << i << ":\n";
+                        std::cout << "  priv:    " << privHex << "\n";
+                        std::cout << "  pubkey:  " << pubHex << "\n";
+                        std::cout << "  hash160: " << hash160Hex << "\n";
                         std::cout << "  target:  ";
                         for (const auto& target : targetHash160s) {
                             std::cout << bytesToHex(target.data(), 20) << " ";
                         }
-                        std::cout << "\\n";
+                        std::cout << "\n";
                         std::cout.flush();
                     }
 
@@ -860,7 +861,7 @@ public:
                     {
                         std::lock_guard<std::mutex> lock(g_debugMutex);
                         std::cout << "[DEBUG] BLOOM CANDIDATE: priv=" << privHex
-                                  << " hash160=" << hash160Hex << "\\n";
+                                  << " hash160=" << hash160Hex << "\n";
                         std::cout.flush();
                     }
 
@@ -874,9 +875,9 @@ public:
                                 g_matchesFound++;
                                 writeFoundKey(g_foundPrivKey, hash160Hex);
 
-                                std::cout << "\\n[DEBUG] *** MATCH FOUND ***\\n";
-                                std::cout << "  Private Key: " << privHex << "\\n";
-                                std::cout << "  Hash160:     " << hash160Hex << "\\n";
+                                std::cout << "\n[DEBUG] *** MATCH FOUND ***\n";
+                                std::cout << "  Private Key: " << privHex << "\n";
+                                std::cout << "  Hash160:     " << hash160Hex << "\n";
                                 std::cout.flush();
                             }
                             return;
@@ -922,34 +923,34 @@ public:
                 std::string thermalStatus = g_thermalPaused.load() ? " [THERMAL PAUSE]" : "";
                 std::string memUsage = getMemoryUsage();
 
-                std::cout << "\\033[2J\\033[H";
+                std::cout << "\033[2J\033[H";
 
-                std::cout << "+==============================================================+\\n"
-                          << "| BTC PUZZLE HUNTER v5.1 - DEBUG EDITION                       |\\n"
-                          << "+==============================================================+\\n"
+                std::cout << "+==============================================================+\n"
+                          << "| BTC PUZZLE HUNTER v5.1 - DEBUG EDITION                       |\n"
+                          << "+==============================================================+\n"
                           << "| Threads: " << std::setw(3) << numThreads
                           << " / " << std::setw(3) << std::thread::hardware_concurrency()
-                          << " active |\\n"
+                          << " active |\n"
                           << "| Keys/sec: " << std::setw(12) << std::fixed << std::setprecision(0) << kps
-                          << " |\\n"
+                          << " |\n"
                           << "| Total: " << std::setw(18) << formatLargeNumber(total)
-                          << " |\\n"
+                          << " |\n"
                           << "| Elapsed: " << std::setw(10) << formatElapsedTime(elapsed)
-                          << " |\\n"
+                          << " |\n"
                           << "| Candidates: " << std::setw(8) << g_totalCandidates.load()
-                          << " |\\n"
+                          << " |\n"
                           << "| Matches: " << std::setw(8) << g_matchesFound.load()
-                          << " |\\n"
+                          << " |\n"
                           << "| Memory: " << std::setw(15) << memUsage
-                          << " |\\n"
+                          << " |\n"
                           << "| Refresh: " << std::setw(6) << statIntervalMs << " ms"
                           << std::setw(18) << ""
                           << thermalStatus;
                 int pad = 20 - (int)thermalStatus.length();
                 if (pad < 0) pad = 0;
                 std::cout << std::setw(pad) << ""
-                          << "|\\n"
-                          << "+==============================================================+\\n";
+                          << "|\n"
+                          << "+==============================================================+\n";
 
                 std::cout.flush();
                 tick++;
@@ -965,23 +966,23 @@ public:
         auto tEnd = std::chrono::high_resolution_clock::now();
         double totalElapsed = std::chrono::duration<double>(tEnd - tStart).count();
 
-        std::cout << "\\033[2J\\033[H";
+        std::cout << "\033[2J\033[H";
         if (g_matchesFound.load() > 0) {
-            std::cout << "+==============================================================+\\n"
-                      << "| MATCH FOUND!                                                 |\\n"
-                      << "+==============================================================+\\n"
-                      << "| Private Key: " << g_foundPrivKey << " |\\n"
-                      << "| Public Key:  " << g_foundPubKey << " |\\n"
-                      << "+==============================================================+\\n";
+            std::cout << "+==============================================================+\n"
+                      << "| MATCH FOUND!                                                 |\n"
+                      << "+==============================================================+\n"
+                      << "| Private Key: " << g_foundPrivKey << " |\n"
+                      << "| Public Key:  " << g_foundPubKey << " |\n"
+                      << "+==============================================================+\n";
         } else {
-            std::cout << "+==============================================================+\\n"
-                      << "| SEARCH COMPLETED                                             |\\n"
-                      << "+==============================================================+\\n"
-                      << "| Total checked: " << std::setw(18) << formatLargeNumber(g_totalChecked.load()) << " |\\n"
-                      << "| Time: " << std::setw(10) << formatElapsedTime(totalElapsed) << " |\\n"
+            std::cout << "+==============================================================+\n"
+                      << "| SEARCH COMPLETED                                             |\n"
+                      << "+==============================================================+\n"
+                      << "| Total checked: " << std::setw(18) << formatLargeNumber(g_totalChecked.load()) << " |\n"
+                      << "| Time: " << std::setw(10) << formatElapsedTime(totalElapsed) << " |\n"
                       << "| Avg k/s: " << std::setw(12) << std::fixed << std::setprecision(0)
-                      << (g_totalChecked.load() / totalElapsed) << " |\\n"
-                      << "+==============================================================+\\n";
+                      << (g_totalChecked.load() / totalElapsed) << " |\n"
+                      << "+==============================================================+\n";
         }
     }
 };
@@ -999,7 +1000,7 @@ int main(int argc, char* argv[]) {
 
     CliArgs args = parseArgs(argc, argv);
     if (args.help) { printUsage(argv[0]); return 0; }
-    if (!args.valid) { std::cerr << "Error: " << args.errorMsg << "\\n\\n"; printUsage(argv[0]); return 1; }
+    if (!args.valid) { std::cerr << "Error: " << args.errorMsg << "\n\n"; printUsage(argv[0]); return 1; }
 
     if (args.selfTest) {
         Secp256K1 testSecp;
@@ -1008,19 +1009,19 @@ int main(int argc, char* argv[]) {
         return testResult ? 0 : 1;
     }
 
-    std::cout << "+==============================================================+\\n"
-              << "| BTC PUZZLE HUNTER v5.1 - DEBUG EDITION                       |\\n"
-              << "| ARM64: MUL/UMULH/MADD/ADC/SBC/CSEL/LDP/STP/PRFM             |\\n"
-              << "| NEON: Bloom Filter + Hash160 Batches + Hex Conv             |\\n"
-              << "| SHA: OpenSSL (correctness verified)                         |\\n"
-              << "| DEBUG: Private/Public/Hash160 tracing enabled               |\\n"
-              << "+==============================================================+\\n\\n";
+    std::cout << "+==============================================================+\n"
+              << "| BTC PUZZLE HUNTER v5.1 - DEBUG EDITION                       |\n"
+              << "| ARM64: MUL/UMULH/MADD/ADC/SBC/CSEL/LDP/STP/PRFM             |\n"
+              << "| NEON: Bloom Filter + Hash160 Batches + Hex Conv             |\n"
+              << "| SHA: OpenSSL (correctness verified)                         |\n"
+              << "| DEBUG: Private/Public/Hash160 tracing enabled               |\n"
+              << "+==============================================================+\n\n";
 
-    std::cout << "[CONFIG] Range: " << args.startRange << " to " << args.endRange << "\\n";
-    std::cout << "[CONFIG] Targets: " << args.targetHash160s.size() << "\\n";
-    std::cout << "[CONFIG] Max Temp: " << args.maxTemp << "C\\n";
-    std::cout << "[CONFIG] Stat Interval: " << args.statIntervalMs << " ms\\n";
-    std::cout << "[CONFIG] Threads: " << std::thread::hardware_concurrency() << "\\n\\n";
+    std::cout << "[CONFIG] Range: " << args.startRange << " to " << args.endRange << "\n";
+    std::cout << "[CONFIG] Targets: " << args.targetHash160s.size() << "\n";
+    std::cout << "[CONFIG] Max Temp: " << args.maxTemp << "C\n";
+    std::cout << "[CONFIG] Stat Interval: " << args.statIntervalMs << " ms\n";
+    std::cout << "[CONFIG] Threads: " << std::thread::hardware_concurrency() << "\n\n";
     std::cout.flush();
 
     OpenSSL_add_all_algorithms();
@@ -1034,19 +1035,19 @@ int main(int argc, char* argv[]) {
     hunter.initialize();
 
     {
-        std::cout << "Running pre-search self-test...\\n";
+        std::cout << "Running pre-search self-test...\n";
         Secp256K1 testSecp;
         testSecp.Init();
         bool testResult = runSelfTest(testSecp);
         if (!testResult) {
-            std::cout << "\\nSELF-TEST FAILED. Search aborted.\\n";
+            std::cout << "\nSELF-TEST FAILED. Search aborted.\n";
             thermalMonitor.stop();
             return 1;
         }
-        std::cout << "Self-test passed. Starting search...\\n\\n";
+        std::cout << "Self-test passed. Starting search...\n\n";
     }
 
-    std::cout << "Starting ARM64-optimized search...\\n";
+    std::cout << "Starting ARM64-optimized search...\n";
     std::cout.flush();
     debugLog("Initialization complete, starting search");
     std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -1054,7 +1055,7 @@ int main(int argc, char* argv[]) {
     hunter.run();
     thermalMonitor.stop();
 
-    std::cout << "\\nPress Enter to exit...";
+    std::cout << "\nPress Enter to exit...";
     std::cin.get();
     debugLog("=== Search Complete ===");
     return 0;
