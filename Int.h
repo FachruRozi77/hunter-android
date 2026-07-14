@@ -178,7 +178,6 @@ void CLEARFF();
 //============================================================================
 // ARM64 NATIVE PRIMITIVES - Pure Inline Assembly
 // Replaces ALL x86 intrinsics with ARM64 equivalents
-// Uses: MUL, UMULH, MADD, MSUB, ADC, SBC, CSEL, CSINC, CSET, LDP, STP, PRFM
 //============================================================================
 
 #if defined(__aarch64__)
@@ -187,15 +186,12 @@ void CLEARFF();
 
 //============================================================================
 // MUL + UMULH - 64x64 -> 128 bit multiplication
-// Uses ARM64 MUL (low) + UMULH (high) - 2-3 cycles total
 //============================================================================
 static inline uint64_t _umul128(uint64_t a, uint64_t b, uint64_t *h) {
 uint64_t lo, hi;
 __asm__ volatile (
-"mul %x[lo], %x[a], %x[b] 
-"
-"umulh %x[hi], %x[a], %x[b] 
-"
+"mul %x[lo], %x[a], %x[b]\n\t"
+"umulh %x[hi], %x[a], %x[b]"
 : [lo] "=&r" (lo), [hi] "=&r" (hi)
 : [a] "r" (a), [b] "r" (b)
 );
@@ -204,15 +200,13 @@ return lo;
 }
 
 //============================================================================
-// 64-bit signed multiply (for imm_imul) - MOVED UP before use
+// 64-bit signed multiply
 //============================================================================
 static inline int64_t _mul128(int64_t a, int64_t b, int64_t *h) {
 int64_t lo, hi;
 __asm__ volatile (
-"smulh %x[hi], %x[a], %x[b] 
-"
-"mul %x[lo], %x[a], %x[b] 
-"
+"smulh %x[hi], %x[a], %x[b]\n\t"
+"mul %x[lo], %x[a], %x[b]"
 : [lo] "=&r" (lo), [hi] "=&r" (hi)
 : [a] "r" (a), [b] "r" (b)
 );
@@ -222,15 +216,12 @@ return lo;
 
 //============================================================================
 // MADD - Multiply-Add: (a * b) + c -> result
-// Critical for Montgomery multiplication accumulation
 //============================================================================
 static inline uint64_t _madd128(uint64_t a, uint64_t b, uint64_t c, uint64_t *carry) {
 uint64_t lo, hi;
 __asm__ volatile (
-"madd %x[lo], %x[a], %x[b], %x[c] 
-"
-"umulh %x[hi], %x[a], %x[b] 
-"
+"madd %x[lo], %x[a], %x[b], %x[c]\n\t"
+"umulh %x[hi], %x[a], %x[b]"
 : [lo] "=&r" (lo), [hi] "=&r" (hi)
 : [a] "r" (a), [b] "r" (b), [c] "r" (c)
 );
@@ -240,19 +231,14 @@ return lo;
 
 //============================================================================
 // MSUB - Multiply-Subtract: (a * b) - c -> result
-// For conditional subtraction in modular reduction
 //============================================================================
 static inline uint64_t _msub128(uint64_t a, uint64_t b, uint64_t c, uint64_t *borrow) {
 uint64_t lo, hi;
 __asm__ volatile (
-"mul %x[lo], %x[a], %x[b] 
-"
-"umulh %x[hi], %x[a], %x[b] 
-"
-"subs %x[lo], %x[lo], %x[c] 
-"
-"sbc %x[hi], %x[hi], xzr 
-"
+"mul %x[lo], %x[a], %x[b]\n\t"
+"umulh %x[hi], %x[a], %x[b]\n\t"
+"subs %x[lo], %x[lo], %x[c]\n\t"
+"sbc %x[hi], %x[hi], xzr"
 : [lo] "=&r" (lo), [hi] "=&r" (hi)
 : [a] "r" (a), [b] "r" (b), [c] "r" (c)
 : "cc"
@@ -263,30 +249,9 @@ return lo;
 
 //============================================================================
 // ADC Chain - Add with Carry propagation
-// Uses ADDS + ADC chain - optimal for ARM64 out-of-order execution
+// FIX v5.0: Use __int128 for guaranteed correctness on ARM64
 //============================================================================
 static inline unsigned char _addcarry_u64(unsigned char cin, uint64_t a, uint64_t b, uint64_t *out) {
-// FIX v5.0: Use proper ARM64 inline assembly for ADCS instead of __int128
-// The __int128 approach was causing compiler optimization issues on ARM64
-uint64_t result;
-unsigned char cout;
-__asm__ volatile (
-"adds %x[res], %x[a], %x[b] 
-"
-"cinc %x[res], %x[res], cs 
-"
-: [res] "=&r" (result)
-: [a] "r" (a + (uint64_t)cin), [b] "r" (b)
-: "cc"
-);
-// Calculate carry out: if result < a, there was a carry
-// Actually, we need proper carry propagation. Use __int128 for correctness
-// but the compiler should optimize this well on ARM64
-// Reverting to __int128 for guaranteed correctness as the inline asm
-// approach above is incorrect for carry propagation
-//
-// The key insight: __int128 addition on ARM64 compiles to ADD/ADCS/ADC
-// which is exactly what we want. The compiler does this correctly.
 typedef unsigned __int128 uint128_t;
 uint128_t r = (uint128_t)a + (uint128_t)b + (uint128_t)cin;
 *out = (uint64_t)r;
@@ -295,37 +260,25 @@ return (unsigned char)(r >> 64);
 
 //============================================================================
 // SBC Chain - Subtract with Borrow propagation
-// FIX v5.0: Corrected implementation using proper borrow semantics
-// The previous implementation was adding borrow instead of subtracting
+// FIX v5.0: Corrected implementation - was adding borrow instead of subtracting
 //============================================================================
 static inline unsigned char _subborrow_u64(unsigned char bin, uint64_t a, uint64_t b, uint64_t *out) {
-// FIX v5.0: Use __int128 for guaranteed correctness.
-// The previous implementation had a bug where borrow was being added
-// instead of subtracted. On ARM64, the compiler generates proper
-// SUBS/SBC sequences from this code.
-//
-// Key fix: a - b - bin (NOT a - b + bin)
 typedef unsigned __int128 uint128_t;
-// Extend to 128-bit, subtract with borrow
 uint128_t a_ext = (uint128_t)a;
 uint128_t b_ext = (uint128_t)b + (uint128_t)bin;
 uint128_t diff = a_ext - b_ext;
 *out = (uint64_t)diff;
-// Carry out (borrow) is the high bit
 return (unsigned char)((uint64_t)(diff >> 64) != 0);
 }
 
 //============================================================================
 // CSEL - Conditional Select (branchless)
-// Replaces: if (cond) dst = a; else dst = b;
 //============================================================================
 static inline uint64_t arm64_csel(uint64_t a, uint64_t b, unsigned char cond) {
 uint64_t result;
 __asm__ volatile (
-"cmp %x[cond], #0 
-"
-"csel %x[res], %x[a], %x[b], ne 
-"
+"cmp %x[cond], #0\n\t"
+"csel %x[res], %x[a], %x[b], ne"
 : [res] "=r" (result)
 : [a] "r" (a), [b] "r" (b), [cond] "r" ((uint64_t)cond)
 : "cc"
@@ -335,16 +288,12 @@ return result;
 
 //============================================================================
 // CSINC - Conditional Select and Increment
-// Replaces: if (cond) dst = a; else dst = b + 1;
-// Used for carry propagation optimization
 //============================================================================
 static inline uint64_t arm64_csinc(uint64_t a, uint64_t b, unsigned char cond) {
 uint64_t result;
 __asm__ volatile (
-"cmp %x[cond], #0 
-"
-"csinc %x[res], %x[a], %x[b], ne 
-"
+"cmp %x[cond], #0\n\t"
+"csinc %x[res], %x[a], %x[b], ne"
 : [res] "=r" (result)
 : [a] "r" (a), [b] "r" (b), [cond] "r" ((uint64_t)cond)
 : "cc"
@@ -354,15 +303,12 @@ return result;
 
 //============================================================================
 // CSET - Conditional Set
-// Sets dst = 1 if condition true, else 0
 //============================================================================
 static inline uint64_t arm64_cset(unsigned char cond) {
 uint64_t result;
 __asm__ volatile (
-"cmp %x[cond], #0 
-"
-"cset %x[res], ne 
-"
+"cmp %x[cond], #0\n\t"
+"cset %x[res], ne"
 : [res] "=r" (result)
 : [cond] "r" ((uint64_t)cond)
 : "cc"
@@ -371,13 +317,11 @@ return result;
 }
 
 //============================================================================
-// LDP/STP - Load/Store Pair for 128-bit operations
-// Loads/stores two 64-bit values in one instruction
+// LDP/STP - Load/Store Pair
 //============================================================================
 static inline void arm64_ldp(uint64_t *dst1, uint64_t *dst2, const uint64_t *src) {
 __asm__ volatile (
-"ldp %x[d1], %x[d2], [%x[src]] 
-"
+"ldp %x[d1], %x[d2], [%x[src]]"
 : [d1] "=r" (*dst1), [d2] "=r" (*dst2)
 : [src] "r" (src)
 );
@@ -385,8 +329,7 @@ __asm__ volatile (
 
 static inline void arm64_stp(uint64_t val1, uint64_t val2, uint64_t *dst) {
 __asm__ volatile (
-"stp %x[v1], %x[v2], [%x[dst]] 
-"
+"stp %x[v1], %x[v2], [%x[dst]]"
 :
 : [v1] "r" (val1), [v2] "r" (val2), [dst] "r" (dst)
 : "memory"
@@ -395,17 +338,14 @@ __asm__ volatile (
 
 //============================================================================
 // PRFM - Prefetch Memory
-// Prefetches data for future use
-// type: 0=LD (load), 1=ST (store), 2=PLD (keep in cache)
-// FIXED: Cannot use array indexing in asm string, use switch/if instead
 //============================================================================
 static inline void arm64_prfm(const void *addr, int type) {
 if (type == 0) {
-__asm__ volatile ("prfm pldl1keep, [%x[addr]]\n" : : [addr] "r" (addr));
+__asm__ volatile ("prfm pldl1keep, [%x[addr]]" : : [addr] "r" (addr));
 } else if (type == 1) {
-__asm__ volatile ("prfm pstl1keep, [%x[addr]]\n" : : [addr] "r" (addr));
+__asm__ volatile ("prfm pstl1keep, [%x[addr]]" : : [addr] "r" (addr));
 } else {
-__asm__ volatile ("prfm pldl2keep, [%x[addr]]\n" : : [addr] "r" (addr));
+__asm__ volatile ("prfm pldl2keep, [%x[addr]]" : : [addr] "r" (addr));
 }
 }
 
@@ -415,8 +355,7 @@ __asm__ volatile ("prfm pldl2keep, [%x[addr]]\n" : : [addr] "r" (addr));
 static inline uint64_t arm64_ror(uint64_t val, uint64_t amt) {
 uint64_t result;
 __asm__ volatile (
-"ror %x[res], %x[val], %x[amt] 
-"
+"ror %x[res], %x[val], %x[amt]"
 : [res] "=r" (result)
 : [val] "r" (val), [amt] "r" (amt)
 );
@@ -425,10 +364,9 @@ return result;
 
 //============================================================================
 // NEON-optimized Bloom Filter hash computation
-// Uses vectorized FNV-1a hash for 4 parallel hashes
 //============================================================================
-static inline void arm64_neon_hash4(const uint8_t* data, size_t len,\
-uint64_t* h1_out, uint64_t* h2_out,\
+static inline void arm64_neon_hash4(const uint8_t* data, size_t len,
+uint64_t* h1_out, uint64_t* h2_out,
 uint64_t* h3_out, uint64_t* h4_out) {
 uint64_t h1 = 0xcbf29ce484222325ULL;
 uint64_t h2 = 0x84222325cbf29ce4ULL;
@@ -474,7 +412,6 @@ return (unsigned char)(r >> 64);
 
 static inline unsigned char _subborrow_u64(unsigned char bin, uint64_t a, uint64_t b, uint64_t *out) {
 typedef unsigned __int128 uint128_t;
-// FIX v5.0: Correct borrow semantics - subtract b and bin from a
 uint128_t a_ext = (uint128_t)a;
 uint128_t b_ext = (uint128_t)b + (uint128_t)bin;
 uint128_t diff = a_ext - b_ext;
@@ -514,8 +451,8 @@ static inline uint64_t arm64_ror(uint64_t val, uint64_t amt) {
 return (val >> amt) | (val << (64 - amt));
 }
 
-static inline void arm64_neon_hash4(const uint8_t* data, size_t len,\
-uint64_t* h1_out, uint64_t* h2_out,\
+static inline void arm64_neon_hash4(const uint8_t* data, size_t len,
+uint64_t* h1_out, uint64_t* h2_out,
 uint64_t* h3_out, uint64_t* h4_out) {
 uint64_t h1 = 0xcbf29ce484222325ULL;
 uint64_t h2 = 0x84222325cbf29ce4ULL;
@@ -542,36 +479,23 @@ h4 ^= (b + 0x27d4eb2f); h4 = (h4 << 19) | (h4 >> 45); h4 *= 0x165667b1;
 // 128-bit Division (portable)
 //============================================================================
 static inline uint64_t _udiv128(uint64_t hi, uint64_t lo, uint64_t d, uint64_t *r) {
-#if defined(__aarch64__)
-// ARM64 has UDIV but not 128-bit division
-// Use software implementation
 typedef unsigned __int128 uint128_t;
 uint128_t n = ((uint128_t)hi << 64) | (uint128_t)lo;
 *r = (uint64_t)(n % d);
 return (uint64_t)(n / d);
-#else
-typedef unsigned __int128 uint128_t;
-uint128_t n = ((uint128_t)hi << 64) | (uint128_t)lo;
-*r = (uint64_t)(n % d);
-return (uint64_t)(n / d);
-#endif
 }
 
 //============================================================================
 // MADD-Optimized Multiplication for ARM64
-// Uses MADD pattern: (a * b) + c with carry tracking
 //============================================================================
 #if defined(__aarch64__)
 
 static inline void imm_mul_madd(uint64_t *x, uint64_t y, uint64_t *dst, uint64_t *carryH) {
 uint64_t h, carry;
 
-// Word 0: MUL + UMULH (no add needed)
 dst[0] = _umul128(x[0], y, &h);
 carry = h;
 
-// Words 1-4: MADD pattern - (x[i] * y) + carry_in
-// Using MADD instruction: dst = (x[i] * y) + carry
 dst[1] = _madd128(x[1], y, carry, &h); carry = h;
 dst[2] = _madd128(x[2], y, carry, &h); carry = h;
 dst[3] = _madd128(x[3], y, carry, &h); carry = h;
@@ -599,10 +523,8 @@ dst[5] = _madd128(x[5], y, carry, &h); carry = h;
 dst[6] = _madd128(x[6], y, carry, &h); carry = h;
 dst[7] = _madd128(x[7], y, carry, &h); carry = h;
 #endif
-// Last word: use signed multiply with proper type casting
 int64_t sh;
 int64_t slo = _mul128((int64_t)x[NB64BLOCK - 1], (int64_t)y, &sh);
-// Use _umul128 for the final add to avoid type issues, or cast properly
 uint64_t final_carry;
 dst[NB64BLOCK - 1] = _madd128((uint64_t)slo, 1ULL, carry, &final_carry);
 *carryH = final_carry + (uint64_t)sh;
@@ -708,32 +630,21 @@ _addcarry_u64(c, 0ULL, carry, dst + (NB64BLOCK - 1));
 }
 
 //============================================================================
-// Shift operations with ROR optimization
+// Shift operations
 //============================================================================
 static inline void shiftR(unsigned char n, uint64_t *d) {
 #if defined(__aarch64__)
-// Use ROR for cross-limb shifts when beneficial
 if (n == 32) {
-// Fast 32-bit right shift using extraction
 __asm__ volatile (
-"lsr %x[d0], %x[d0], #32 
-"
-"bfi %x[d0], %x[d1], #32, #32 
-"
-"lsr %x[d1], %x[d1], #32 
-"
-"bfi %x[d1], %x[d2], #32, #32 
-"
-"lsr %x[d2], %x[d2], #32 
-"
-"bfi %x[d2], %x[d3], #32, #32 
-"
-"lsr %x[d3], %x[d3], #32 
-"
-"bfi %x[d3], %x[d4], #32, #32 
-"
-"lsr %x[d4], %x[d4], #32 
-"
+"lsr %x[d0], %x[d0], #32\n\t"
+"bfi %x[d0], %x[d1], #32, #32\n\t"
+"lsr %x[d1], %x[d1], #32\n\t"
+"bfi %x[d1], %x[d2], #32, #32\n\t"
+"lsr %x[d2], %x[d2], #32\n\t"
+"bfi %x[d2], %x[d3], #32, #32\n\t"
+"lsr %x[d3], %x[d3], #32\n\t"
+"bfi %x[d3], %x[d4], #32, #32\n\t"
+"lsr %x[d4], %x[d4], #32"
 : [d0] "+r" (d[0]), [d1] "+r" (d[1]), [d2] "+r" (d[2]),
 [d3] "+r" (d[3]), [d4] "+r" (d[4])
 );
@@ -798,18 +709,18 @@ __asm__ volatile ("rev %x0, %x1" : "=r"(r) : "r"(x));
 return r;
 }
 #define LZC(x) ({ uint64_t _r; __asm__("clz %x0, %x1" : "=r"(_r) : "r"((uint64_t)(x))); _r; })
-#define TZC(x) ({ uint64_t _r; __asm__("rbit %x0, %x1\nclz %x0, %x0" : "=r"(_r) : "r"((uint64_t)(x))); _r; })
+#define TZC(x) ({ uint64_t _r; __asm__("rbit %x0, %x1\n\tclz %x0, %x0" : "=r"(_r) : "r"((uint64_t)(x))); _r; })
 #else
 #define _byteswap_uint64 __builtin_bswap64
 #define LZC(x) __builtin_clzll(x)
 #define TZC(x) __builtin_ctzll(x)
 #endif
 
-#define LoadI64(i,i64) \\
-i.bits64[0] = i64; \\
-i.bits64[1] = i64 >> 63; \\
-i.bits64[2] = i.bits64[1];\\\\
-i.bits64[3] = i.bits64[1];\\\\
-i.bits64[4] = i.bits64[1];\\
+#define LoadI64(i,i64) \\ \\
+  i.bits64[0] = i64; \\ \\
+  i.bits64[1] = i64 >> 63; \\ \\
+  i.bits64[2] = i.bits64[1];\\ \\
+  i.bits64[3] = i.bits64[1];\\ \\
+  i.bits64[4] = i.bits64[1];\\
 
 #endif // BIGINTH
