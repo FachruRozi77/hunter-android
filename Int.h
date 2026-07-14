@@ -252,31 +252,16 @@ return lo;
 
 //============================================================================
 // ADC Chain - Add with Carry propagation
-// Uses ADDS + ADC chain - optimal for ARM64 out-of-order execution
+// FIX v4.2: Replaced broken CSINC-based inline assembly with __int128
+// arithmetic that compilers optimize to correct ADCS sequences on ARM64.
 //============================================================================
 static inline unsigned char _addcarry_u64(unsigned char cin, uint64_t a, uint64_t b, uint64_t *out) {
-uint64_t result;
-unsigned char cout;
-if (__builtin_expect(cin, 0)) {
-__asm__ volatile (
-"adds %x[res], %x[a], %x[b] \n"
-"csinc %x[res], %x[res], %x[res], cc \n"
-"cset %w[co], cs \n"
-: [res] "=&r" (result), [co] "=r" (cout)
-: [a] "r" (a), [b] "r" (b)
-: "cc"
-);
-} else {
-__asm__ volatile (
-"adds %x[res], %x[a], %x[b] \n"
-"cset %w[co], cs \n"
-: [res] "=&r" (result), [co] "=r" (cout)
-: [a] "r" (a), [b] "r" (b)
-: "cc"
-);
-}
-*out = result;
-return cout;
+    // FIX v4.2: Replaced broken CSINC-based inline assembly with __int128
+    // arithmetic that compilers optimize to correct ADCS sequences on ARM64.
+    typedef unsigned __int128 uint128_t;
+    uint128_t r = (uint128_t)a + (uint128_t)b + (uint128_t)cin;
+    *out = (uint64_t)r;
+    return (unsigned char)(r >> 64);
 }
 
 //============================================================================
