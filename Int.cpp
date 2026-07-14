@@ -1438,13 +1438,9 @@ a.Mult(&e);
 a.Add(&c);
 if (!a.IsEqual(&d)) {
 ok = false;
-printf("Div() Results Wrong \nN: %s\nD: %s\nQ: %s\nR: %s\nCheck: %s\n",\\
-d.GetBase16().c_str(),\\
-b.GetBase16().c_str(),\\
-f.GetBase16().c_str(),\\
-c.GetBase16().c_str(),\\
-a.GetBase16().c_str()\\
-);
+printf("Div() Results Wrong \nN: %s\nD: %s\nQ: %s\nR: %s\nCheck: %s\n",
+       d.GetBase16().c_str(), b.GetBase16().c_str(), f.GetBase16().c_str(),
+       c.GetBase16().c_str(), a.GetBase16().c_str());
 return;
 }
 
