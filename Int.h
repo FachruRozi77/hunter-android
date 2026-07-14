@@ -172,7 +172,6 @@ uint64_t Mult(Int *a, uint32_t b);
 int GetLowestBit();
 void CLEAR();
 void CLEARFF();
-void DivStep62(Int* u,Int* v,int64_t* eta,int *pos,int64_t* uu,int64_t* uv,int64_t* vu,int64_t* vv);
 };
 
 //============================================================================
@@ -282,31 +281,16 @@ return cout;
 
 //============================================================================
 // SBC Chain - Subtract with Borrow propagation
-// Uses SUBS + SBC chain
+// FIX v4.1: Replaced broken CSINC-based implementation with correct
+// 128-bit arithmetic that compiler optimizes to proper SUBS/SBC on ARM64
 //============================================================================
 static inline unsigned char _subborrow_u64(unsigned char bin, uint64_t a, uint64_t b, uint64_t *out) {
-uint64_t result;
-unsigned char bout;
-if (__builtin_expect(bin, 0)) {
-__asm__ volatile (
-"subs %x[res], %x[a], %x[b] \n"
-"csinc %x[res], %x[res], %x[res], cc \n"
-"cset %w[bo], cc \n"
-: [res] "=&r" (result), [bo] "=r" (bout)
-: [a] "r" (a), [b] "r" (b)
-: "cc"
-);
-} else {
-__asm__ volatile (
-"subs %x[res], %x[a], %x[b] \n"
-"cset %w[bo], cc \n"
-: [res] "=&r" (result), [bo] "=r" (bout)
-: [a] "r" (a), [b] "r" (b)
-: "cc"
-);
-}
-*out = result;
-return bout;
+    // Use 128-bit arithmetic for guaranteed correctness
+    // On ARM64, clang/GCC compiles this to optimal SUBS/SBC sequence
+    typedef unsigned __int128 uint128_t;
+    uint128_t diff = (uint128_t)a - (uint128_t)b - (uint128_t)bin;
+    *out = (uint64_t)diff;
+    return (unsigned char)((uint64_t)(diff >> 64) != 0);
 }
 
 //============================================================================
@@ -790,8 +774,8 @@ return r;
 #define LoadI64(i,i64) \\
 i.bits64[0] = i64; \\
 i.bits64[1] = i64 >> 63; \\
-i.bits64[2] = i.bits64[1];\\\
-i.bits64[3] = i.bits64[1];\\\
+i.bits64[2] = i.bits64[1];\\\\
+i.bits64[3] = i.bits64[1];\\\\
 i.bits64[4] = i.bits64[1];\\
 
 #endif // BIGINTH
