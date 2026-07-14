@@ -170,6 +170,7 @@ uint64_t AddC(Int* a);
 void AddAndShift(Int* a,Int* b,uint64_t cH);
 uint64_t Mult(Int *a, uint32_t b);
 int GetLowestBit();
+void DivStep62(Int* u,Int* v,int64_t* eta,int* pos,int64_t* uu,int64_t* uv,int64_t* vu,int64_t* vv);
 void CLEAR();
 void CLEARFF();
 };
@@ -252,8 +253,7 @@ return lo;
 
 //============================================================================
 // ADC Chain - Add with Carry propagation
-// FIX v4.2: Replaced broken CSINC-based inline assembly with __int128
-// arithmetic that compilers optimize to correct ADCS sequences on ARM64.
+// Uses ADDS + ADC chain - optimal for ARM64 out-of-order execution
 //============================================================================
 static inline unsigned char _addcarry_u64(unsigned char cin, uint64_t a, uint64_t b, uint64_t *out) {
     // FIX v4.2: Replaced broken CSINC-based inline assembly with __int128
