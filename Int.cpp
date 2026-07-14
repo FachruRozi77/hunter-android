@@ -1550,17 +1550,14 @@ printf("Avg = %.2f\n",(double)totalCount/200000.0);
 a.Rand(pSize);
 b.Rand(pSize-64);
 t0 = Timer::get_tick();
-uint64_t c0 = my_rdtsc();
 for (int i = 0; i < 400000; i++) {
-a.Add(&b);
-a.ModInv();
+  a.Add(&b);
+  a.ModInv();
 }
-uint64_t c1 = my_rdtsc();
 t1 = Timer::get_tick();
 
 printf("ModInv() Results OK : ");
 Timer::printResult("Inv", 400000, 0, t1 - t0);
-printf("ModInv() cycles : %.2f\n",(double)(c1-c0)/400000.0);
 double movInvCost = (t1-t0);
 
 // ModSqrt ---------------------------------------------------------------------------
