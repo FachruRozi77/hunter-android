@@ -551,41 +551,76 @@ result = str[i] + result; count++;
 return result;
 }
 
-// FIX v5.0: Fixed random range generation - was missing +1 for inclusive end
-// Also added better handling for edge cases
+//============================================================================
+// FIXED Random Private Key Generation
+// - Fast path now covers any range that fits in 64 bits
+// - Slow path correctly fills ALL NB64BLOCK blocks before Mod reduction
+// - Eliminated the broken 32-bit interleaved shift logic
+//============================================================================
 static inline void generateRandomIntInRange(const Int& start, const Int& rangeSize, Int& result, FastRandom& rng) {
-// Check if range fits in 32 bits for fast path
-bool rangeFits32 = true;
-for (int i = 1; i < NB64BLOCK; i++) {
-if (rangeSize.bits64[i] != 0) { rangeFits32 = false; break; }
-}
 
-if (rangeFits32 && rangeSize.bits64[0] <= 0xFFFFFFFFULL) {
-// Fast path: 32-bit range
-uint64_t r = rng.next();
-uint32_t range32 = (uint32_t)rangeSize.bits64[0];
-// FIX v5.0: Handle range32 == 0 case (shouldn't happen but safety first)
-if (range32 == 0) {
-result.Set((Int*)&start);
-return;
-}
-uint64_t modded = r % range32;
-result.SetInt32(0);
-result.bits64[0] = modded;
-Int startCopy; startCopy.Set((Int*)&start); result.Add(&startCopy);
-} else {
-// Slow path: full 256-bit
-uint64_t data[4];
-for(int i = 0; i < 4; i++) data[i] = rng.next();
-result.SetInt32(0);
-for(int i = 0; i < 4; i++) {
-Int temp; temp.SetInt32(uint32_t(data[i])); temp.ShiftL(32 * i); result.Add(&temp);
-temp.SetInt32(uint32_t(data[i] >> 32)); temp.ShiftL(32 * (i + 4)); result.Add(&temp);
-}
-Int rangeCopy; rangeCopy.Set((Int*)&rangeSize);
-result.Mod(&rangeCopy);
-Int startCopy; startCopy.Set((Int*)&start); result.Add(&startCopy);
-}
+    // ---------------------------------------------------------------------
+    // Fast path: range fits entirely in one 64-bit word
+    // ---------------------------------------------------------------------
+    bool rangeFits64 = true;
+    for (int i = 1; i < NB64BLOCK; i++) {
+        if (rangeSize.bits64[i] != 0) {
+            rangeFits64 = false;
+            break;
+        }
+    }
+
+    if (rangeFits64) {
+        uint64_t range64 = rangeSize.bits64[0];
+        // Defensive: range of 0 or 1 means only 'start' is valid
+        if (range64 <= 1) {
+            result.Set((Int*)&start);
+            return;
+        }
+        uint64_t modded = rng.next() % range64;
+        result.SetInt32(0);
+        result.bits64[0] = modded;
+        Int startCopy;
+        startCopy.Set((Int*)&start);
+        result.Add(&startCopy);
+        return;
+    }
+
+    // ---------------------------------------------------------------------
+    // Slow path: multi-precision uniform random in [0, rangeSize-1]
+    // We fill every 64-bit block with random entropy, then reduce modulo
+    // rangeSize.  This is slightly slower than a bitmask, but it is
+    // correct for ANY range size and avoids the bias of the old code.
+    // ---------------------------------------------------------------------
+    result.SetInt32(0);  // Clear all blocks
+
+    // Build a random NB64BLOCK*64 bit value by stacking random uint64s
+    for (int i = 0; i < NB64BLOCK; i++) {
+        uint64_t r = rng.next();
+        if (r == 0 && i == 0) {
+            // Ensure we don't accidentally short-circuit the whole number
+            r = rng.next();
+        }
+
+        Int chunk;
+        chunk.SetInt32(0);
+        chunk.bits64[0] = r;
+
+        if (i > 0) {
+            chunk.ShiftL(64 * i);
+        }
+        result.Add(&chunk);
+    }
+
+    // Reduce to [0, rangeSize-1]
+    Int rangeCopy;
+    rangeCopy.Set((Int*)&rangeSize);
+    result.Mod(&rangeCopy);
+
+    // Shift into [start, end]
+    Int startCopy;
+    startCopy.Set((Int*)&start);
+    result.Add(&startCopy);
 }
 
 //============================================================================
