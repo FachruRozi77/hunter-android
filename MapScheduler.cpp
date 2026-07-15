@@ -166,16 +166,19 @@ bool MapScheduler::getNextSequentialMap(MapRange& out) {
 bool MapScheduler::getRandomMap(MapRange& out, FastRandom& rng) {
     std::lock_guard<std::mutex> lock(schedulerMutex);
     
-    uint64_t remaining = getRemainingMaps();
+    // Inline remaining calculation to avoid recursive mutex deadlock
+    uint64_t remaining = totalMaps - finishedMaps.size() - assignedMaps.size();
     if (remaining == 0) return false;
     
     // If remaining is small, enumerate and pick
     if (remaining <= 1000) {
         std::vector<uint64_t> available;
-        for (uint64_t i = 0; i < totalMaps && available.size() < remaining; i++) {
+        available.reserve(remaining);
+        for (uint64_t i = 0; i < totalMaps; i++) {
             if (finishedMaps.find(i) == finishedMaps.end() &&
                 assignedMaps.find(i) == assignedMaps.end()) {
                 available.push_back(i);
+                if (available.size() >= remaining) break;
             }
         }
         if (available.empty()) return false;
