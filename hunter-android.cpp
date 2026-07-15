@@ -449,7 +449,7 @@ public:
     PuzzleHunter(int statMs = DEFAULT_STAT_INTERVAL_MS, ThermalMonitor* therm = nullptr,
                  ScanMode mode = ScanMode::SEQUENTIAL)
         : statIntervalMs(statMs), thermalMonitor(therm), scanMode(mode),
-          currentMapId(0), progressFile("Progress.dat") {
+          progressFile("Progress.dat"), currentMapId(0) {
         secp.Init();
         numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4;
