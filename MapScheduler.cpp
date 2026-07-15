@@ -23,24 +23,20 @@ void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
 
 void MapScheduler::computeMapRanges(const Int& totalElements) {
     // n = floor(sqrt(TotalElements))
-    // Use double approximation for sqrt, then refine with integer math
     double approx = totalElements.ToDouble();
     if (approx < 1.0) approx = 1.0;
     uint64_t n = (uint64_t)std::sqrt(approx);
     if (n < 1) n = 1;
 
-    mapSize.SetInt32((uint32_t)(n & 0xFFFFFFFF));
-    if (n > 0xFFFFFFFFULL) {
-        // Handle larger values
-        mapSize.SetInt32(0xFFFFFFFF);
-    }
+    // Properly set mapSize as an Int from uint64_t
+    mapSize.SetInt32(0);
+    mapSize.SetQWord(0, n);   // <-- Use SetQWord instead of SetInt32
 
     // map_count = ceil(totalElements / mapSize)
     Int temp;
     temp.Set(&totalElements);
     temp.Add(&mapSize);
     temp.SubOne();
-    // Integer division: temp / mapSize
     Int mapCountInt;
     mapCountInt.Set(&temp);
     mapCountInt.Div(&mapSize, nullptr);
