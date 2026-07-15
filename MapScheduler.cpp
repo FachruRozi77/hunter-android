@@ -5,6 +5,56 @@
 #include <iostream>
 #include <algorithm>
 
+// FIX #3: Integer square root for Int class (Newton's method)
+// Used instead of double sqrt() to avoid precision loss on 256-bit values.
+static Int integerSqrt(const Int& n) {
+    if (n.IsZero() || n.IsOne()) {
+        Int r; r.Set(&n); return r;
+    }
+    
+    Int x; 
+    x.Set(&n);
+    x.ShiftR(1);  // x = n / 2
+    
+    Int two; 
+    two.SetInt32(2);
+    
+    Int last; 
+    last.Set(&x);
+    
+    for (int iter = 0; iter < 300; ++iter) {
+        // q = n / x
+        Int q, rmd;
+        q.Set(&n);
+        q.Div(&x, &rmd);
+        
+        // sum = x + q
+        Int sum;
+        sum.Add(&x, &q);
+        
+        // sum = sum / 2
+        sum.ShiftR(1);
+        
+        if (sum.IsEqual(&x) || sum.IsEqual(&last)) {
+            // Verify floor sqrt: if sum*sum > n, decrement
+            Int sq;
+            sq.Mult(&sum, &sum);
+            if (sq.IsGreater(&n)) {
+                sum.SubOne();
+            }
+            return sum;
+        }
+        last.Set(&x);
+        x.Set(&sum);
+    }
+    
+    // Fallback verification
+    Int sq;
+    sq.Mult(&x, &x);
+    if (sq.IsGreater(&n)) x.SubOne();
+    return x;
+}
+
 MapScheduler::MapScheduler() : totalMaps(0), mode(ScanMode::SEQUENTIAL) {}
 
 MapScheduler::~MapScheduler() {}
@@ -19,15 +69,31 @@ void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
     totalElements.AddOne();
 
     computeMapRanges(totalElements);
+    
+    // FIX #13: Apply bitmap loaded from progress file now that mapRanges exist
+    if (!pendingBitmap.empty()) {
+        if (pendingBitmap.size() == finishedBitmap.size()) {
+            restoreFinishedBitmap(pendingBitmap);
+        } else {
+            std::cerr << "[RESUME] Pending bitmap size mismatch: file=" 
+                      << pendingBitmap.size() << " expected=" 
+                      << finishedBitmap.size() << "\n";
+        }
+        pendingBitmap.clear();
+    }
 }
 
 void MapScheduler::computeMapRanges(const Int& totalElements) {
-    double approx = totalElements.ToDouble();
-    if (approx < 1.0) approx = 1.0;
-    uint64_t n = (uint64_t)std::sqrt(approx);
+    // FIX #3: Use integer square root instead of double to prevent precision loss
+    Int sqrtInt = integerSqrt(totalElements);
+    uint64_t n = 1;
+    if (sqrtInt.GetBitLength() <= 64) {
+        n = sqrtInt.bits64[0];
+    } else {
+        n = 0xFFFFFFFFFFFFFFFFULL;
+    }
     if (n < 1) n = 1;
 
-    // FIX: Properly set mapSize from uint64_t without truncation
     mapSize.SetInt32(0);
     mapSize.SetQWord(0, n);
 
@@ -86,23 +152,26 @@ bool MapScheduler::getNextSequentialMap(MapRange& out) {
     return false;
 }
 
+// FIX #6: Eliminate per-call vector allocation; scan-forward from random start
 bool MapScheduler::getRandomMap(MapRange& out, FastRandom& rng) {
     std::lock_guard<std::mutex> lock(schedulerMutex);
 
-    std::vector<uint64_t> available;
-    for (uint64_t i = 0; i < totalMaps; i++) {
-        if (!mapRanges[i].finished && !mapRanges[i].assigned) {
-            available.push_back(i);
+    uint64_t remaining = getRemainingMaps();
+    if (remaining == 0) return false;
+
+    uint64_t startIdx = rng.next() % totalMaps;
+    uint64_t idx = startIdx;
+
+    do {
+        if (!mapRanges[idx].finished && !mapRanges[idx].assigned) {
+            mapRanges[idx].assigned = true;
+            out = mapRanges[idx];
+            return true;
         }
-    }
+        idx = (idx + 1) % totalMaps;
+    } while (idx != startIdx);
 
-    if (available.empty()) return false;
-
-    uint64_t idx = rng.next() % available.size();
-    uint64_t mapId = available[idx];
-    mapRanges[mapId].assigned = true;
-    out = mapRanges[mapId];
-    return true;
+    return false;
 }
 
 void MapScheduler::finishMap(uint64_t mapId) {
@@ -230,9 +299,10 @@ bool MapScheduler::loadProgress(const std::string& filename, ScanMode& loadMode,
         } else if (key == "CurrentOffset") {
             currentOffset.SetBase16(const_cast<char*>(val.c_str()));
         } else if (key == "Bitmap") {
-            finishedBitmap.clear();
+            // FIX #13: Store in pendingBitmap to be applied after initializeMapRanges
+            pendingBitmap.clear();
             for (char c : val) {
-                finishedBitmap.push_back(c == '1');
+                pendingBitmap.push_back(c == '1');
             }
         } else if (key == "Target") {
             targetHashes.push_back(val);
