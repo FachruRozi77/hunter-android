@@ -22,17 +22,15 @@ void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
 }
 
 void MapScheduler::computeMapRanges(const Int& totalElements) {
-    // n = floor(sqrt(TotalElements))
     double approx = totalElements.ToDouble();
     if (approx < 1.0) approx = 1.0;
     uint64_t n = (uint64_t)std::sqrt(approx);
     if (n < 1) n = 1;
 
-    // Properly set mapSize as an Int from uint64_t
+    // FIX: Properly set mapSize from uint64_t without truncation
     mapSize.SetInt32(0);
-    mapSize.SetQWord(0, n);   // <-- Use SetQWord instead of SetInt32
+    mapSize.SetQWord(0, n);
 
-    // map_count = ceil(totalElements / mapSize)
     Int temp;
     temp.Set(&totalElements);
     temp.Add(&mapSize);
@@ -60,7 +58,6 @@ void MapScheduler::computeMapRanges(const Int& totalElements) {
         mapEnd.Add(&mapSize);
         mapEnd.SubOne();
 
-        // Last map or beyond endRange
         if (i == totalMaps - 1 || mapEnd.IsGreater(&endRange)) {
             mapEnd.Set(&endRange);
         }
@@ -72,7 +69,6 @@ void MapScheduler::computeMapRanges(const Int& totalElements) {
 
         mapRanges.push_back(mr);
 
-        // Next start = this end + 1
         currentStart.Set(&mapEnd);
         currentStart.AddOne();
     }
@@ -93,7 +89,6 @@ bool MapScheduler::getNextSequentialMap(MapRange& out) {
 bool MapScheduler::getRandomMap(MapRange& out, FastRandom& rng) {
     std::lock_guard<std::mutex> lock(schedulerMutex);
 
-    // Collect unfinished, unassigned map IDs
     std::vector<uint64_t> available;
     for (uint64_t i = 0; i < totalMaps; i++) {
         if (!mapRanges[i].finished && !mapRanges[i].assigned) {
@@ -126,6 +121,20 @@ void MapScheduler::assignMap(uint64_t mapId) {
     }
 }
 
+void MapScheduler::restoreFinishedBitmap(const std::vector<bool>& bitmap) {
+    std::lock_guard<std::mutex> lock(schedulerMutex);
+    if (bitmap.size() != finishedBitmap.size()) {
+        std::cerr << "[RESUME] Bitmap size mismatch: file=" << bitmap.size() 
+                  << " expected=" << finishedBitmap.size() << "\n";
+        return;
+    }
+    finishedBitmap = bitmap;
+    for (size_t i = 0; i < mapRanges.size() && i < bitmap.size(); i++) {
+        mapRanges[i].finished = bitmap[i];
+        mapRanges[i].assigned = false;
+    }
+}
+
 uint64_t MapScheduler::getTotalMaps() const {
     return totalMaps;
 }
@@ -141,11 +150,10 @@ uint64_t MapScheduler::getRemainingMaps() const {
 }
 
 uint64_t MapScheduler::getMapSize() const {
-    // Approximate
     if (mapSize.GetBitLength() <= 64) {
         return mapSize.bits64[0];
     }
-    return 0xFFFFFFFFULL;
+    return 0xFFFFFFFFFFFFFFFFULL;
 }
 
 double MapScheduler::getOverallPercent() const {
@@ -175,14 +183,12 @@ bool MapScheduler::saveProgress(const std::string& filename, ScanMode saveMode,
     fs << "CurrentMap=" << currentMapId << "\n";
     fs << "CurrentOffset=" << currentOffset.GetBase16() << "\n";
 
-    // Bitmap
     fs << "Bitmap=";
     for (bool b : finishedBitmap) {
         fs << (b ? '1' : '0');
     }
     fs << "\n";
 
-    // Targets
     fs << "TargetCount=" << targetHashes.size() << "\n";
     for (const auto& h : targetHashes) {
         fs << "Target=" << h << "\n";
