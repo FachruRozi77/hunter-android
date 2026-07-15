@@ -19,16 +19,13 @@ public:
     MapScheduler();
     ~MapScheduler();
 
-    // Phase 2: Build map ranges
     void initializeMapRanges(const Int& startRange, const Int& endRange);
 
-    // Phase 5: Worker API
     bool getNextSequentialMap(MapRange& out);
     bool getRandomMap(MapRange& out, FastRandom& rng);
     void finishMap(uint64_t mapId);
     void assignMap(uint64_t mapId);
 
-    // Phase 7: Progress
     bool saveProgress(const std::string& filename, ScanMode mode,
                       uint64_t currentMapId, const Int& currentOffset,
                       const std::string& startHex, const std::string& endHex,
@@ -38,7 +35,8 @@ public:
                       std::string& startHex, std::string& endHex,
                       std::vector<std::string>& targetHashes);
 
-    // Stats
+    void restoreFinishedBitmap(const std::vector<bool>& bitmap);
+
     uint64_t getTotalMaps() const;
     uint64_t getCompletedMaps() const;
     uint64_t getRemainingMaps() const;
@@ -48,7 +46,6 @@ public:
     ScanMode getMode() const { return mode; }
     void setMode(ScanMode m) { mode = m; }
 
-    // Bitmap access for progress
     const std::vector<bool>& getFinishedBitmap() const { return finishedBitmap; }
 
 private:
