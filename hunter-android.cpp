@@ -24,7 +24,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <regex>
-#include <condition_variable>  // FIX #7: Added for thermal monitor CV
+#include <condition_variable>
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -57,8 +57,6 @@ static constexpr int POINTS_BATCH_SIZE = 256;
 static constexpr int HASH_BATCH_SIZE = 8;
 static constexpr int SAVE_INTERVAL_SEC = 60;
 static constexpr int DEFAULT_STAT_INTERVAL_MS = 30000;
-// FIX #14: BLOOM_FILTER_BITS is now the actual BIT count (not byte count).
-// Filter array is allocated as (bits+7)/8 bytes.
 static constexpr size_t BLOOM_FILTER_BITS = 1 << 24;
 static constexpr int BLOOM_HASHES = 12;
 static constexpr int MAX_THREADS = 256;
@@ -228,7 +226,6 @@ public:
     ThermalMonitor(int maxTempC) : maxTemp(maxTempC) {}
     ~ThermalMonitor() { stop(); }
 
-    // FIX #7: Efficient blocking wait instead of polling
     void waitForResume() {
         std::unique_lock<std::mutex> lock(cv_mutex);
         cv.wait(lock, [this]() { return !paused.load() || !running.load(); });
@@ -244,7 +241,7 @@ public:
                 if (currentTemp >= 0) {
                     if (currentTemp >= maxTemp && !paused.load()) {
                         paused.store(true);
-                        cv.notify_all();  // Wake workers so they block immediately
+                        cv.notify_all();
                         std::cout << "\n[THERMAL] CPU temp " << currentTemp
                                   << "C (max " << maxTemp << "C). Pausing "
                                   << THERMAL_PAUSE_MINUTES << " min...\n";
@@ -254,7 +251,7 @@ public:
                                 std::chrono::steady_clock::now() - pauseStart).count();
                             if (elapsed >= THERMAL_PAUSE_MINUTES * 60) {
                                 paused.store(false);
-                                cv.notify_all();  // Wake all workers
+                                cv.notify_all();
                                 std::cout << "[THERMAL] Resume.\n";
                                 break;
                             }
@@ -262,7 +259,7 @@ public:
                             int newTemp = getCPUTemperature();
                             if (newTemp >= 0 && newTemp < maxTemp - 5) {
                                 paused.store(false);
-                                cv.notify_all();  // Wake all workers
+                                cv.notify_all();
                                 std::cout << "[THERMAL] Temp dropped to " << newTemp
                                           << "C. Resuming early...\n";
                                 break;
@@ -278,7 +275,7 @@ public:
     void stop() {
         running.store(false);
         paused.store(false);
-        cv.notify_all();  // Wake any waiting workers
+        cv.notify_all();
         if (monitorThread.joinable()) monitorThread.join();
     }
 
@@ -290,8 +287,6 @@ public:
 // LOCK-FREE BLOOM FILTER
 // ============================================================================
 
-// FIX #14: BLOOM_FILTER_BITS is the total bit count.
-// The underlying byte array is (bits+7)/8 elements.
 class alignas(64) BloomFilter {
 private:
     std::vector<std::atomic<uint8_t>> filter;
@@ -317,7 +312,6 @@ public:
         uint64_t h1, h2; hash_bytes(data, len, h1, h2);
         for (int i = 0; i < BLOOM_HASHES; i++) {
             uint64_t h = (h1 + i * h2) % BLOOM_FILTER_BITS;
-            // FIX #2: Use release ordering so test() threads see complete writes
             filter[h / 8].fetch_or(1 << (h % 8), std::memory_order_release);
         }
         count.fetch_add(1, std::memory_order_relaxed);
@@ -326,7 +320,6 @@ public:
         uint64_t h1, h2; hash_bytes(data, len, h1, h2);
         for (int i = 0; i < BLOOM_HASHES; i++) {
             uint64_t h = (h1 + i * h2) % BLOOM_FILTER_BITS;
-            // FIX #2: Use acquire ordering to synchronize with add()
             if (!(filter[h / 8].load(std::memory_order_acquire) & (1 << (h % 8)))) return false;
         }
         return true;
@@ -351,7 +344,6 @@ struct alignas(64) ThreadStats {
 static std::atomic<bool> g_matchFound{false};
 static std::atomic<unsigned long long> g_totalChecked{0};
 static std::atomic<unsigned long long> g_totalCandidates{0};
-static std::atomic<unsigned long long> g_matchesFound{0};
 static std::atomic<bool> g_thermalPaused{false};
 
 static std::string g_foundPrivKey;
@@ -442,7 +434,390 @@ static std::string getMemoryUsage() {
 }
 
 // ============================================================================
-// MAIN HUNTER CLASS - MAP SCHEDULER IMPLEMENTATION
+// COOPERATIVE MAP SCHEDULER
+// ============================================================================
+// All threads work on the SAME map. When the map is exhausted, they move to
+// the next map together. This maximizes cache locality and simplifies progress
+// tracking — only one map is "active" at any time.
+
+class CooperativeMapScheduler {
+public:
+    CooperativeMapScheduler() : totalMaps(0), mode(ScanMode::SEQUENTIAL),
+        currentMapId(0), mapFinished(false), nextSequentialHint(0) {}
+
+    void initialize(const Int& start, const Int& end) {
+        std::lock_guard<std::mutex> lock(mutex);
+        startRange.Set(const_cast<Int*>(&start));
+        endRange.Set(const_cast<Int*>(&end));
+
+        Int totalElements;
+        totalElements.Sub(const_cast<Int*>(&end), const_cast<Int*>(&start));
+        totalElements.AddOne();
+
+        // Compute map size = sqrt(totalElements)
+        Int sqrtInt = integerSqrt(totalElements);
+        uint64_t n = 1;
+        Int sqrtCopy; sqrtCopy.Set(&sqrtInt);
+        if (sqrtCopy.GetBitLength() <= 64) {
+            n = sqrtInt.bits64[0];
+        } else {
+            n = 0xFFFFFFFFFFFFFFFFULL;
+        }
+        if (n < 1) n = 1;
+
+        mapSize.SetInt32(0);
+        mapSize.SetQWord(0, n);
+
+        Int temp;
+        temp.Set(const_cast<Int*>(&totalElements));
+        temp.Add(&mapSize);
+        temp.SubOne();
+        Int mapCountInt;
+        mapCountInt.Set(&temp);
+        mapCountInt.Div(&mapSize, nullptr);
+        totalMaps = mapCountInt.GetInt32();
+        if (totalMaps == 0) totalMaps = 1;
+
+        finishedMaps.clear();
+        currentMapId = 0;
+        mapFinished = false;
+        nextSequentialHint = 0;
+
+        // Compute initial current map
+        computeCurrentMap();
+    }
+
+    // Get the next batch of private keys from the CURRENT shared map.
+    // Returns number of keys filled (0 if current map is exhausted).
+    // When a map is exhausted, this automatically advances to the next map.
+    int getNextBatch(Int* outKeys, int maxCount) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        // If current map is exhausted, advance to next
+        while (mapFinished || currentMapId >= totalMaps) {
+            if (currentMapId >= totalMaps) {
+                return 0; // All maps done
+            }
+            // Mark previous as finished
+            finishedMaps.insert(currentMapId);
+            // Advance to next map
+            advanceToNextMap();
+            if (currentMapId >= totalMaps) {
+                return 0;
+            }
+        }
+
+        int count = 0;
+        for (int i = 0; i < maxCount; i++) {
+            if (currentOffset.IsGreater(&currentMapEnd)) {
+                mapFinished = true;
+                finishedMaps.insert(currentMapId);
+                break;
+            }
+            outKeys[count].Set(&currentOffset);
+            count++;
+            currentOffset.AddOne();
+        }
+        return count;
+    }
+
+    // For progress display
+    uint64_t getCurrentMapId() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+        return currentMapId;
+    }
+
+    uint64_t getTotalMaps() const {
+        return totalMaps;
+    }
+
+    uint64_t getCompletedMaps() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+        return finishedMaps.size();
+    }
+
+    uint64_t getMapSize() const {
+        Int copy; copy.Set(const_cast<Int*>(&mapSize));
+        if (copy.GetBitLength() <= 64) return mapSize.bits64[0];
+        return 0xFFFFFFFFFFFFFFFFULL;
+    }
+
+    double getOverallPercent() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+        if (totalMaps == 0) return 0.0;
+        return (double)finishedMaps.size() / (double)totalMaps * 100.0;
+    }
+
+    bool isComplete() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+        return finishedMaps.size() >= totalMaps;
+    }
+
+    ScanMode getMode() const { return mode; }
+    void setMode(ScanMode m) { mode = m; }
+
+    // Compute a MapRange for display purposes
+    MapRange getCurrentMapRange() const {
+        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+        MapRange mr;
+        mr.id = currentMapId;
+        mr.start.Set(const_cast<Int*>(&currentMapStart));
+        mr.end.Set(const_cast<Int*>(&currentMapEnd));
+        return mr;
+    }
+
+    // Progress save/load
+    bool saveProgress(const std::string& filename, ScanMode saveMode,
+                      const Int& currentOffset,
+                      const std::string& startHex, const std::string& endHex,
+                      const std::vector<std::string>& targetHashes) {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::ofstream fs(filename);
+        if (!fs) return false;
+
+        fs << "Version=4\n";
+        fs << "Mode=" << (saveMode == ScanMode::SEQUENTIAL ? "Sequential" : "Random") << "\n";
+        fs << "StartRange=" << startRange.GetBase16() << "\n";
+        fs << "EndRange=" << endRange.GetBase16() << "\n";
+        fs << "MapSize=" << getMapSize() << "\n";
+        fs << "TotalMaps=" << totalMaps << "\n";
+        fs << "CurrentMap=" << currentMapId << "\n";
+
+        Int offsetCopy;
+        offsetCopy.Set(const_cast<Int*>(&currentOffset));
+        fs << "CurrentOffset=" << offsetCopy.GetBase16() << "\n";
+
+        fs << "FinishedCount=" << finishedMaps.size() << "\n";
+        for (uint64_t id : finishedMaps) {
+            fs << "Finished=" << id << "\n";
+        }
+
+        fs << "TargetCount=" << targetHashes.size() << "\n";
+        for (const auto& h : targetHashes) {
+            fs << "Target=" << h << "\n";
+        }
+
+        fs.flush();
+        return fs.good();
+    }
+
+    bool loadProgress(const std::string& filename, ScanMode& loadMode,
+                      uint64_t& loadedCurrentMap, Int& loadedOffset,
+                      std::string& loadStartHex, std::string& loadEndHex,
+                      std::vector<std::string>& targetHashes) {
+        std::ifstream fs(filename);
+        if (!fs) return false;
+
+        std::string line;
+        std::string modeStr;
+        uint64_t loadedMapSize = 0;
+        uint64_t loadedTotalMaps = 0;
+        uint64_t loadedFinishedCount = 0;
+        uint64_t finishedRead = 0;
+
+        finishedMaps.clear();
+
+        while (std::getline(fs, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            std::string key = line.substr(0, eq);
+            std::string val = line.substr(eq + 1);
+
+            if (key == "Version") {
+                if (val != "4") {
+                    std::cerr << "[RESUME] Old progress file format (Version=" << val
+                              << "). Please start fresh.\n";
+                    return false;
+                }
+            } else if (key == "Mode") {
+                modeStr = val;
+            } else if (key == "StartRange") {
+                loadStartHex = val;
+                startRange.SetBase16(const_cast<char*>(val.c_str()));
+            } else if (key == "EndRange") {
+                loadEndHex = val;
+                endRange.SetBase16(const_cast<char*>(val.c_str()));
+            } else if (key == "MapSize") {
+                loadedMapSize = std::stoull(val);
+                mapSize.SetInt32(0);
+                mapSize.SetQWord(0, loadedMapSize);
+            } else if (key == "TotalMaps") {
+                loadedTotalMaps = std::stoull(val);
+                totalMaps = loadedTotalMaps;
+            } else if (key == "CurrentMap") {
+                loadedCurrentMap = std::stoull(val);
+            } else if (key == "CurrentOffset") {
+                loadedOffset.SetBase16(const_cast<char*>(val.c_str()));
+            } else if (key == "FinishedCount") {
+                loadedFinishedCount = std::stoull(val);
+            } else if (key == "Finished") {
+                finishedMaps.insert(std::stoull(val));
+                finishedRead++;
+            } else if (key == "Target") {
+                targetHashes.push_back(val);
+            }
+        }
+
+        if (finishedRead != loadedFinishedCount) {
+            std::cerr << "[RESUME] Warning: Expected " << loadedFinishedCount
+                      << " finished maps but read " << finishedRead << "\n";
+        }
+
+        // Restore state
+        currentMapId = loadedCurrentMap;
+        mode = (modeStr == "Random") ? ScanMode::RANDOM : ScanMode::SEQUENTIAL;
+        nextSequentialHint = 0;
+        while (nextSequentialHint < totalMaps &&
+               finishedMaps.find(nextSequentialHint) != finishedMaps.end()) {
+            nextSequentialHint++;
+        }
+
+        computeCurrentMap();
+        // Set offset to the loaded offset if it's within current map
+        if (!loadedOffset.IsZero() &&
+            !loadedOffset.IsLower(&currentMapStart) &&
+            !loadedOffset.IsGreater(&currentMapEnd)) {
+            currentOffset.Set(&loadedOffset);
+            mapFinished = false;
+        }
+
+        return true;
+    }
+
+private:
+    Int startRange;
+    Int endRange;
+    Int mapSize;
+    uint64_t totalMaps;
+    ScanMode mode;
+
+    // Current shared map state
+    uint64_t currentMapId;
+    Int currentMapStart;
+    Int currentMapEnd;
+    Int currentOffset;
+    bool mapFinished;
+
+    std::set<uint64_t> finishedMaps;
+    uint64_t nextSequentialHint;
+    mutable std::mutex mutex;
+
+    static Int integerSqrt(const Int& n) {
+        Int nCopy;
+        nCopy.Set(const_cast<Int*>(&n));
+        if (nCopy.IsZero() || nCopy.IsOne()) return nCopy;
+
+        Int x; x.Set(&nCopy); x.ShiftR(1);
+        Int last; last.Set(&x);
+
+        for (int iter = 0; iter < 300; ++iter) {
+            Int q, rmd;
+            q.Set(&nCopy); q.Div(&x, &rmd);
+            Int sum; sum.Add(&x, &q); sum.ShiftR(1);
+            if (sum.IsEqual(&x) || sum.IsEqual(&last)) {
+                Int sq; sq.Mult(&sum, &sum);
+                if (sq.IsGreater(&nCopy)) sum.SubOne();
+                return sum;
+            }
+            last.Set(&x);
+            x.Set(&sum);
+        }
+        Int sq; sq.Mult(&x, &x);
+        if (sq.IsGreater(&nCopy)) x.SubOne();
+        return x;
+    }
+
+    void computeCurrentMap() {
+        // Calculate start: startRange + (currentMapId * mapSize)
+        currentMapStart.Set(&startRange);
+        if (currentMapId > 0) {
+            Int offset;
+            offset.SetInt32(0);
+            offset.SetQWord(0, currentMapId);
+            offset.Mult(&offset, &mapSize);
+            currentMapStart.Add(&offset);
+        }
+
+        // Calculate end: start + mapSize - 1
+        currentMapEnd.Set(&currentMapStart);
+        currentMapEnd.Add(&mapSize);
+        currentMapEnd.SubOne();
+
+        // Clamp to global end
+        if (currentMapEnd.IsGreater(&endRange)) {
+            currentMapEnd.Set(&endRange);
+        }
+
+        currentOffset.Set(&currentMapStart);
+        mapFinished = false;
+    }
+
+    void advanceToNextMap() {
+        if (mode == ScanMode::SEQUENTIAL) {
+            // Find next unprocessed map, filling gaps
+            do {
+                currentMapId++;
+            } while (currentMapId < totalMaps &&
+                     finishedMaps.find(currentMapId) != finishedMaps.end());
+        } else {
+            // Random: pick from remaining unfinished maps
+            uint64_t remaining = totalMaps - finishedMaps.size();
+            if (remaining == 0) {
+                currentMapId = totalMaps;
+                return;
+            }
+
+            if (remaining <= 1000) {
+                std::vector<uint64_t> available;
+                for (uint64_t i = 0; i < totalMaps; i++) {
+                    if (finishedMaps.find(i) == finishedMaps.end()) {
+                        available.push_back(i);
+                    }
+                }
+                if (!available.empty()) {
+                    // Use a simple hash of time for randomness
+                    uint64_t idx = std::chrono::steady_clock::now().time_since_epoch().count() % available.size();
+                    currentMapId = available[idx];
+                } else {
+                    currentMapId = totalMaps;
+                }
+            } else {
+                // Probabilistic sampling
+                uint64_t attempts = 0;
+                bool found = false;
+                while (attempts < 1000 && !found) {
+                    uint64_t candidate = std::chrono::steady_clock::now().time_since_epoch().count() % totalMaps;
+                    if (finishedMaps.find(candidate) == finishedMaps.end()) {
+                        currentMapId = candidate;
+                        found = true;
+                    }
+                    attempts++;
+                }
+                if (!found) {
+                    // Fallback: linear scan from random start
+                    uint64_t start = std::chrono::steady_clock::now().time_since_epoch().count() % totalMaps;
+                    for (uint64_t i = 0; i < totalMaps; i++) {
+                        uint64_t candidate = (start + i) % totalMaps;
+                        if (finishedMaps.find(candidate) == finishedMaps.end()) {
+                            currentMapId = candidate;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) currentMapId = totalMaps;
+                }
+            }
+        }
+
+        if (currentMapId < totalMaps) {
+            computeCurrentMap();
+        }
+    }
+};
+
+// ============================================================================
+// MAIN HUNTER CLASS - COOPERATIVE MAP SCHEDULER
 // ============================================================================
 
 class PuzzleHunter {
@@ -452,17 +827,13 @@ private:
     Secp256K1 secp;
     Int startRange, endRange;
     std::unique_ptr<BloomFilter> bloom;
-    std::unique_ptr<MapScheduler> scheduler;
+    std::unique_ptr<CooperativeMapScheduler> scheduler;
     int numThreads;
     int statIntervalMs;
     ThermalMonitor* thermalMonitor;
     ScanMode scanMode;
     std::string progressFile;
-    // FIX: currentMapId is atomic because multiple workers write it
-    std::atomic<uint64_t> currentMapId{0};
-    Int currentOffset;
     std::atomic<bool> saveRequested{false};
-    std::vector<Int> threadCurrentKeys;
     std::mutex progressMutex;
 
 public:
@@ -473,8 +844,7 @@ public:
         secp.Init();
         numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4;
-        threadCurrentKeys.resize(numThreads);
-        scheduler = std::make_unique<MapScheduler>();
+        scheduler = std::make_unique<CooperativeMapScheduler>();
         scheduler->setMode(mode);
     }
 
@@ -497,14 +867,14 @@ public:
     void initialize() {
         bloom = std::make_unique<BloomFilter>();
         for (const auto& target : targetHash160s) bloom->add(target.data(), 20);
-        scheduler->initializeMapRanges(startRange, endRange);
+        scheduler->initialize(startRange, endRange);
 
         std::cout << "[SCHEDULER] Total maps: " << scheduler->getTotalMaps() << "\n";
         std::cout << "[SCHEDULER] Map size:   ~" << formatLargeNumber(scheduler->getMapSize()) << " keys\n";
         std::cout << "[SCHEDULER] Mode:       " << (scanMode == ScanMode::SEQUENTIAL ? "Sequential" : "Random") << "\n";
     }
 
-        bool checkResume(const std::string& startHex, const std::string& endHex,
+    bool checkResume(const std::string& startHex, const std::string& endHex,
                      const std::vector<std::string>& targetHashes) {
         std::ifstream test("Progress.dat");
         if (!test.good()) return false;
@@ -516,12 +886,12 @@ public:
         if (response != "y" && response != "Y") return false;
 
         ScanMode loadedMode;
-        uint64_t loadedMapId = 0;
+        uint64_t loadedCurrentMap = 0;
         Int loadedOffset;
         std::string loadedStart, loadedEnd;
         std::vector<std::string> loadedTargets;
 
-        if (!scheduler->loadProgress(progressFile, loadedMode, loadedMapId, loadedOffset,
+        if (!scheduler->loadProgress(progressFile, loadedMode, loadedCurrentMap, loadedOffset,
                                      loadedStart, loadedEnd, loadedTargets)) {
             std::cout << "[RESUME] Failed to load progress file.\n";
             return false;
@@ -545,21 +915,17 @@ public:
         }
 
         scanMode = loadedMode;
-        currentMapId.store(loadedMapId);
-        currentOffset.Set(&loadedOffset);
         scheduler->setMode(loadedMode);
 
-        std::cout << "[RESUME] Restored: " << scheduler->getCompletedMaps() << " / " 
-                  << scheduler->getTotalMaps() << " maps finished.\n";
-        std::cout << "[RESUME] Mode: " << (loadedMode == ScanMode::SEQUENTIAL ? "Sequential" : "Random") << "\n";
+        std::cout << "[RESUME] Restored: Map " << loadedCurrentMap
+                  << ", Offset " << intToHex(loadedOffset) << "\n";
+        std::cout << "[RESUME] Completed: " << scheduler->getCompletedMaps() << " / "
+                  << scheduler->getTotalMaps() << " maps\n";
         return true;
     }
 
-        void workerThread(int tid, ThreadStats& stats) {
+    void workerThread(int tid, ThreadStats& stats) {
         setThreadAffinity(tid);
-
-        FastRandom rng((uint64_t)(tid + 1) * 0x9e3779b97f4a7c15ULL +
-                      (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count());
 
         std::vector<Int> batchPrivKeys(POINTS_BATCH_SIZE);
         std::vector<Point> ptBatch(POINTS_BATCH_SIZE);
@@ -568,12 +934,8 @@ public:
         uint8_t hashRes[HASH_BATCH_SIZE][20];
         unsigned long long localChecked = 0, localCandidates = 0;
 
-        MapRange currentMap;
-        bool hasMap = false;
-        Int mapCurrent;
-
         while (!g_matchFound.load(std::memory_order_relaxed) && !g_shutdownRequested.load()) {
-            // FIX #7: Use condition variable instead of polling
+            // Thermal pause check
             if (thermalMonitor && thermalMonitor->isPaused()) {
                 g_thermalPaused.store(true);
                 thermalMonitor->waitForResume();
@@ -581,44 +943,16 @@ public:
             }
             g_thermalPaused.store(false);
 
-            if (!hasMap) {
-                if (scanMode == ScanMode::SEQUENTIAL) {
-                    hasMap = scheduler->getNextSequentialMap(currentMap);
-                } else {
-                    hasMap = scheduler->getRandomMap(currentMap, rng);
-                }
+            // Get next batch from the CURRENT shared map
+            int batchCount = scheduler->getNextBatch(batchPrivKeys.data(), POINTS_BATCH_SIZE);
 
-                if (!hasMap) {
-                    if (scheduler->isComplete()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                    continue;
-                }
-
-                mapCurrent.Set(&currentMap.start);
-                currentMapId.store(currentMap.id);
-
-                std::cout << "[WORKER " << tid << "] Assigned Map " << currentMap.id
-                          << " [" << intToHex(currentMap.start) << " - " << intToHex(currentMap.end) << "]\n";
+            if (batchCount == 0) {
+                // All maps complete
+                if (scheduler->isComplete()) break;
+                // Map switching, brief yield
+                std::this_thread::yield();
+                continue;
             }
-
-            int batchCount = 0;
-            for (int i = 0; i < POINTS_BATCH_SIZE && hasMap; i++) {
-                batchPrivKeys[i].Set(&mapCurrent);
-                batchCount++;
-                mapCurrent.AddOne();
-
-                if (mapCurrent.IsGreater(&currentMap.end)) {
-                    scheduler->finishMap(currentMap.id);
-                    hasMap = false;
-                    break;
-                }
-            }
-
-            if (batchCount == 0) continue;
-
-            // FIX #5: Save the NEXT unprocessed key (mapCurrent) after the batch,
-            // not the last processed key. This prevents re-checking keys on resume.
-            threadCurrentKeys[tid].Set(&mapCurrent);
 
             secp.ComputePublicKeyBatch(batchPrivKeys.data(), batchCount, ptBatch.data());
 
@@ -670,16 +1004,6 @@ public:
         stats.candidates.fetch_add(localCandidates, std::memory_order_relaxed);
         g_totalChecked.fetch_add(localChecked, std::memory_order_relaxed);
         g_totalCandidates.fetch_add(localCandidates, std::memory_order_relaxed);
-
-        if (hasMap) {
-            // If we exited early (match found or shutdown), unassign so another
-            // worker can pick it up. If finished normally, finishMap was already called.
-            if (g_matchFound.load() || g_shutdownRequested.load()) {
-                scheduler->unassignMap(currentMap.id);
-            } else {
-                scheduler->finishMap(currentMap.id);
-            }
-        }
     }
 
     void run() {
@@ -706,9 +1030,9 @@ public:
                 double kps = (elapsed > 0) ? total / elapsed : 0;
 
                 uint64_t completed = scheduler->getCompletedMaps();
-                uint64_t remaining = scheduler->getRemainingMaps();
-                double percent = scheduler->getOverallPercent();
                 uint64_t totalMaps = scheduler->getTotalMaps();
+                uint64_t remaining = totalMaps - completed;
+                double percent = scheduler->getOverallPercent();
 
                 double mapsPerSec = (elapsed > 0) ? (double)completed / elapsed : 0;
                 double estRemainingSec = (mapsPerSec > 0) ? remaining / mapsPerSec : 0;
@@ -718,41 +1042,29 @@ public:
 
                 auto nowSteady = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::seconds>(nowSteady - lastSave).count() >= SAVE_INTERVAL_SEC) {
-                    // FIX #4: Save the MINIMUM offset across all threads, not the first.
-                    // This guarantees no keys are skipped on resume.
+                    // Save progress: current map + offset within that map
+                    MapRange currentMap = scheduler->getCurrentMapRange();
                     Int saveOffset;
-                    saveOffset.Set(&endRange);
-                    bool foundActive = false;
-                    for (int i = 0; i < numThreads; i++) {
-                        if (!threadCurrentKeys[i].IsZero()) {
-                            if (!foundActive || threadCurrentKeys[i].IsLower(&saveOffset)) {
-                                saveOffset.Set(&threadCurrentKeys[i]);
-                                foundActive = true;
-                            }
-                        }
-                    }
-                    if (!foundActive) saveOffset.Set(&startRange);
+                    saveOffset.Set(&currentMap.start); // Default to map start
 
                     std::vector<std::string> targetStrs;
                     for (const auto& t : targetHash160s) {
                         targetStrs.push_back(bytesToHex(t.data(), 20));
                     }
 
-                    scheduler->saveProgress(progressFile, scanMode, currentMapId.load(), saveOffset,
+                    scheduler->saveProgress(progressFile, scanMode, saveOffset,
                                            intToHex(startRange), intToHex(endRange), targetStrs);
                     lastSave = nowSteady;
                 }
 
-                // FIX #8: Use ANSI escape instead of system("clear") for portability
                 std::cout << "\033[2J\033[H";
-                
-                // FIX #15: Show N/A when estimate is impossible
-                std::string estStr = (mapsPerSec > 0.0 && remaining > 0) 
-                                     ? formatElapsedTime(estRemainingSec) 
+
+                std::string estStr = (mapsPerSec > 0.0 && remaining > 0)
+                                     ? formatElapsedTime(estRemainingSec)
                                      : "N/A";
 
                 std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
-                          << "║         BTC PUZZLE HUNTER v4.0 - MAP SCHEDULER               ║\n"
+                          << "║         BTC PUZZLE HUNTER v4.0 - COOPERATIVE MAPS            ║\n"
                           << "╠══════════════════════════════════════════════════════════════╣\n"
                           << "║ Threads:    " << std::setw(3) << numThreads
                           << " / " << std::setw(3) << std::thread::hardware_concurrency() << " active          ║\n"
@@ -762,6 +1074,7 @@ public:
                           << "║ Maps:       " << std::setw(8) << completed << " / " << std::setw(8) << totalMaps << "          ║\n"
                           << "║ Remaining:  " << std::setw(8) << remaining << "                        ║\n"
                           << "║ Progress:   " << std::setw(10) << std::fixed << std::setprecision(2) << percent << "%                  ║\n"
+                          << "║ Current Map: " << std::setw(8) << scheduler->getCurrentMapId() << "                        ║\n"
                           << "╠══════════════════════════════════════════════════════════════╣\n"
                           << "║ KEY PROGRESS                                                 ║\n"
                           << "║ Keys/sec:   " << std::setw(12) << std::fixed << std::setprecision(0) << kps << "              ║\n"
@@ -790,10 +1103,9 @@ public:
         for (const auto& t : targetHash160s) targetStrs.push_back(bytesToHex(t.data(), 20));
         Int finalOffset;
         finalOffset.Set(&endRange);
-        scheduler->saveProgress(progressFile, scanMode, currentMapId.load(), finalOffset,
+        scheduler->saveProgress(progressFile, scanMode, finalOffset,
                                intToHex(startRange), intToHex(endRange), targetStrs);
 
-        // FIX #8: ANSI clear
         std::cout << "\033[2J\033[H";
         if (g_matchesFound.load() > 0) {
             std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
@@ -832,8 +1144,8 @@ int main(int argc, char* argv[]) {
     ScanMode mode = args.randomMode ? ScanMode::RANDOM : ScanMode::SEQUENTIAL;
 
     std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
-              << "║     BTC Puzzle Hunter v4.0 - MAP SCHEDULER                     ║\n"
-              << "║     Sequential/Random Maps + Batch Inversion + Resume          ║\n"
+              << "║     BTC Puzzle Hunter v4.0 - COOPERATIVE MAPS                ║\n"
+              << "║     All Threads + One Map + Batch Inversion + Resume         ║\n"
               << "╚══════════════════════════════════════════════════════════════╝\n\n";
 
     std::cout << "[CONFIG] Range: " << args.startRange << " to " << args.endRange << "\n";
@@ -855,8 +1167,6 @@ int main(int argc, char* argv[]) {
 
     bool resumed = hunter.checkResume(args.startRange, args.endRange, args.targetHash160s);
 
-    // FIX #16: Do NOT re-initialize if we successfully resumed.
-    // Re-initialization would overwrite the loaded bitmap and lose progress.
     if (!resumed) {
         hunter.initialize();
     } else {
