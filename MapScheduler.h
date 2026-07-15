@@ -51,6 +51,7 @@ public:
 private:
     std::vector<MapRange> mapRanges;
     std::vector<bool> finishedBitmap;
+    std::vector<bool> pendingBitmap;  // FIX #13: Loaded from file, applied after init
     std::mutex schedulerMutex;
     Int startRange;
     Int endRange;
