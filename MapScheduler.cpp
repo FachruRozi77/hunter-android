@@ -5,9 +5,10 @@
 #include <iostream>
 #include <algorithm>
 
-// FIX #3: Integer square root for Int class (Newton's method)
+// Integer square root for Int class (Newton's method)
 // Used instead of double sqrt() to avoid precision loss on 256-bit values.
-static Int integerSqrt(const Int& n) {
+// NOTE: Int methods are not const-correct, so n is passed by non-const reference.
+static Int integerSqrt(Int& n) {
     if (n.IsZero() || n.IsOne()) {
         Int r; r.Set(&n); return r;
     }
@@ -65,7 +66,8 @@ void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
     endRange = end;
 
     Int totalElements;
-    totalElements.Sub(&end, &start);
+    totalElements.Set(&endRange);
+    totalElements.Sub(&startRange);
     totalElements.AddOne();
 
     computeMapRanges(totalElements);
@@ -83,7 +85,7 @@ void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
     }
 }
 
-void MapScheduler::computeMapRanges(const Int& totalElements) {
+void MapScheduler::computeMapRanges(Int& totalElements) {
     // FIX #3: Use integer square root instead of double to prevent precision loss
     Int sqrtInt = integerSqrt(totalElements);
     uint64_t n = 1;
@@ -219,7 +221,9 @@ uint64_t MapScheduler::getRemainingMaps() const {
 }
 
 uint64_t MapScheduler::getMapSize() const {
-    if (mapSize.GetBitLength() <= 64) {
+    Int temp;
+    temp.Set(&mapSize);
+    if (temp.GetBitLength() <= 64) {
         return mapSize.bits64[0];
     }
     return 0xFFFFFFFFFFFFFFFFULL;
@@ -247,10 +251,15 @@ bool MapScheduler::saveProgress(const std::string& filename, ScanMode saveMode,
     fs << "StartRange=" << startRange.GetBase16() << "\n";
     fs << "EndRange=" << endRange.GetBase16() << "\n";
     fs << "MapCount=" << totalMaps << "\n";
-    fs << "Interval=" << getMapSize() << "\n";
+    Int temp;
+    temp.Set(&mapSize);
+    fs << "Interval=" << temp.GetBitLength() << "\n";
     fs << "CompletedMaps=" << getCompletedMaps() << "\n";
     fs << "CurrentMap=" << currentMapId << "\n";
-    fs << "CurrentOffset=" << currentOffset.GetBase16() << "\n";
+    
+    Int offsetCopy;
+    offsetCopy.Set(&currentOffset);
+    fs << "CurrentOffset=" << offsetCopy.GetBase16() << "\n";
 
     fs << "Bitmap=";
     for (bool b : finishedBitmap) {
