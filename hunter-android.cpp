@@ -342,6 +342,7 @@ struct alignas(64) ThreadStats {
 // ============================================================================
 
 static std::atomic<bool> g_matchFound{false};
+static std::atomic<unsigned long long> g_matchesFound{0};
 static std::atomic<unsigned long long> g_totalChecked{0};
 static std::atomic<unsigned long long> g_totalCandidates{0};
 static std::atomic<bool> g_thermalPaused{false};
