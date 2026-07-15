@@ -3,6 +3,7 @@
 
 #include "MapRange.h"
 #include "Int.h"
+#include "FastRandom.h"
 #include <vector>
 #include <mutex>
 #include <cstdint>
