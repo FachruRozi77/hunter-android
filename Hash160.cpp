@@ -13,6 +13,11 @@ Hash160::~Hash160() {
 }
 
 void Hash160::compute(const uint8_t pubKey[33], uint8_t out[20]) {
+    // FIX #1: Fully reset contexts before each use to prevent state corruption
+    // in OpenSSL 3.x when reused across thousands of calls.
+    EVP_MD_CTX_reset(sha_ctx);
+    EVP_MD_CTX_reset(ripemd_ctx);
+
     unsigned int sha_len = SHA256_DIGEST_LENGTH;
     unsigned int ripemd_len = RIPEMD160_DIGEST_LENGTH;
     uint8_t sha_result[SHA256_DIGEST_LENGTH];
