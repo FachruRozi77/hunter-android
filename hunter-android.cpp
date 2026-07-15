@@ -1,5 +1,5 @@
 // ============================================================================
-// BTC PUZZLE HUNTER v4.0 - MAP SCHEDULER EDITION
+// BTC PUZZLE HUNTER v4.0 - MAP SCHEDULER EDITION (PATCHED)
 // Phases 1-12 Implementation
 // ============================================================================
 
@@ -24,6 +24,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <regex>
+#include <condition_variable>  // FIX #7: Added for thermal monitor CV
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
@@ -56,6 +57,8 @@ static constexpr int POINTS_BATCH_SIZE = 4096;
 static constexpr int HASH_BATCH_SIZE = 64;
 static constexpr int SAVE_INTERVAL_SEC = 60;
 static constexpr int DEFAULT_STAT_INTERVAL_MS = 30000;
+// FIX #14: BLOOM_FILTER_BITS is now the actual BIT count (not byte count).
+// Filter array is allocated as (bits+7)/8 bytes.
 static constexpr size_t BLOOM_FILTER_BITS = 1 << 24;
 static constexpr int BLOOM_HASHES = 12;
 static constexpr int MAX_THREADS = 256;
@@ -188,6 +191,8 @@ private:
     std::atomic<bool> paused{false};
     std::thread monitorThread;
     std::atomic<bool> running{false};
+    std::mutex cv_mutex;
+    std::condition_variable cv;
 
     int readTempFromZone(const std::string& path) {
         std::ifstream fs(path);
@@ -223,6 +228,12 @@ public:
     ThermalMonitor(int maxTempC) : maxTemp(maxTempC) {}
     ~ThermalMonitor() { stop(); }
 
+    // FIX #7: Efficient blocking wait instead of polling
+    void waitForResume() {
+        std::unique_lock<std::mutex> lock(cv_mutex);
+        cv.wait(lock, [this]() { return !paused.load() || !running.load(); });
+    }
+
     void start() {
         if (running.load()) return;
         running.store(true);
@@ -233,6 +244,7 @@ public:
                 if (currentTemp >= 0) {
                     if (currentTemp >= maxTemp && !paused.load()) {
                         paused.store(true);
+                        cv.notify_all();  // Wake workers so they block immediately
                         std::cout << "\n[THERMAL] CPU temp " << currentTemp
                                   << "C (max " << maxTemp << "C). Pausing "
                                   << THERMAL_PAUSE_MINUTES << " min...\n";
@@ -242,6 +254,7 @@ public:
                                 std::chrono::steady_clock::now() - pauseStart).count();
                             if (elapsed >= THERMAL_PAUSE_MINUTES * 60) {
                                 paused.store(false);
+                                cv.notify_all();  // Wake all workers
                                 std::cout << "[THERMAL] Resume.\n";
                                 break;
                             }
@@ -249,6 +262,7 @@ public:
                             int newTemp = getCPUTemperature();
                             if (newTemp >= 0 && newTemp < maxTemp - 5) {
                                 paused.store(false);
+                                cv.notify_all();  // Wake all workers
                                 std::cout << "[THERMAL] Temp dropped to " << newTemp
                                           << "C. Resuming early...\n";
                                 break;
@@ -264,6 +278,7 @@ public:
     void stop() {
         running.store(false);
         paused.store(false);
+        cv.notify_all();  // Wake any waiting workers
         if (monitorThread.joinable()) monitorThread.join();
     }
 
@@ -275,6 +290,8 @@ public:
 // LOCK-FREE BLOOM FILTER
 // ============================================================================
 
+// FIX #14: BLOOM_FILTER_BITS is the total bit count.
+// The underlying byte array is (bits+7)/8 elements.
 class alignas(64) BloomFilter {
 private:
     std::vector<std::atomic<uint8_t>> filter;
@@ -293,14 +310,15 @@ private:
         h1 = hash_mix(h1); h2 = hash_mix(h2);
     }
 public:
-    BloomFilter() : filter(BLOOM_FILTER_BITS) {
+    BloomFilter() : filter((BLOOM_FILTER_BITS + 7) / 8) {
         for(auto& f : filter) f.store(0, std::memory_order_relaxed);
     }
     void add(const uint8_t* data, size_t len) {
         uint64_t h1, h2; hash_bytes(data, len, h1, h2);
         for (int i = 0; i < BLOOM_HASHES; i++) {
             uint64_t h = (h1 + i * h2) % BLOOM_FILTER_BITS;
-            filter[h / 8].fetch_or(1 << (h % 8), std::memory_order_relaxed);
+            // FIX #2: Use release ordering so test() threads see complete writes
+            filter[h / 8].fetch_or(1 << (h % 8), std::memory_order_release);
         }
         count.fetch_add(1, std::memory_order_relaxed);
     }
@@ -308,7 +326,8 @@ public:
         uint64_t h1, h2; hash_bytes(data, len, h1, h2);
         for (int i = 0; i < BLOOM_HASHES; i++) {
             uint64_t h = (h1 + i * h2) % BLOOM_FILTER_BITS;
-            if (!(filter[h / 8].load(std::memory_order_relaxed) & (1 << (h % 8)))) return false;
+            // FIX #2: Use acquire ordering to synchronize with add()
+            if (!(filter[h / 8].load(std::memory_order_acquire) & (1 << (h % 8)))) return false;
         }
         return true;
     }
@@ -439,7 +458,8 @@ private:
     ThermalMonitor* thermalMonitor;
     ScanMode scanMode;
     std::string progressFile;
-    uint64_t currentMapId;
+    // FIX: currentMapId is atomic because multiple workers write it
+    std::atomic<uint64_t> currentMapId{0};
     Int currentOffset;
     std::atomic<bool> saveRequested{false};
     std::vector<Int> threadCurrentKeys;
@@ -449,7 +469,7 @@ public:
     PuzzleHunter(int statMs = DEFAULT_STAT_INTERVAL_MS, ThermalMonitor* therm = nullptr,
                  ScanMode mode = ScanMode::SEQUENTIAL)
         : statIntervalMs(statMs), thermalMonitor(therm), scanMode(mode),
-          progressFile("Progress.dat"), currentMapId(0) {
+          progressFile("Progress.dat") {
         secp.Init();
         numThreads = std::thread::hardware_concurrency();
         if (numThreads == 0) numThreads = 4;
@@ -525,7 +545,7 @@ public:
         }
 
         scanMode = loadedMode;
-        currentMapId = loadedMapId;
+        currentMapId.store(loadedMapId);
         currentOffset.Set(&loadedOffset);
         scheduler->setMode(loadedMode);
 
@@ -552,9 +572,10 @@ public:
         Int mapCurrent;
 
         while (!g_matchFound.load(std::memory_order_relaxed) && !g_shutdownRequested.load()) {
+            // FIX #7: Use condition variable instead of polling
             if (thermalMonitor && thermalMonitor->isPaused()) {
                 g_thermalPaused.store(true);
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                thermalMonitor->waitForResume();
                 continue;
             }
             g_thermalPaused.store(false);
@@ -573,7 +594,7 @@ public:
                 }
 
                 mapCurrent.Set(&currentMap.start);
-                currentMapId = currentMap.id;
+                currentMapId.store(currentMap.id);
 
                 std::cout << "[WORKER " << tid << "] Assigned Map " << currentMap.id
                           << " [" << intToHex(currentMap.start) << " - " << intToHex(currentMap.end) << "]\n";
@@ -583,7 +604,6 @@ public:
             for (int i = 0; i < POINTS_BATCH_SIZE && hasMap; i++) {
                 batchPrivKeys[i].Set(&mapCurrent);
                 batchCount++;
-                threadCurrentKeys[tid].Set(&mapCurrent);
                 mapCurrent.AddOne();
 
                 if (mapCurrent.IsGreater(&currentMap.end)) {
@@ -594,6 +614,10 @@ public:
             }
 
             if (batchCount == 0) continue;
+
+            // FIX #5: Save the NEXT unprocessed key (mapCurrent) after the batch,
+            // not the last processed key. This prevents re-checking keys on resume.
+            threadCurrentKeys[tid].Set(&mapCurrent);
 
             secp.ComputePublicKeyBatch(batchPrivKeys.data(), batchCount, ptBatch.data());
 
@@ -687,26 +711,39 @@ public:
 
                 auto nowSteady = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::seconds>(nowSteady - lastSave).count() >= SAVE_INTERVAL_SEC) {
+                    // FIX #4: Save the MINIMUM offset across all threads, not the first.
+                    // This guarantees no keys are skipped on resume.
                     Int saveOffset;
-                    saveOffset.Set(&startRange);
+                    saveOffset.Set(&endRange);
+                    bool foundActive = false;
                     for (int i = 0; i < numThreads; i++) {
                         if (!threadCurrentKeys[i].IsZero()) {
-                            saveOffset.Set(&threadCurrentKeys[i]);
-                            break;
+                            if (!foundActive || threadCurrentKeys[i].IsLower(&saveOffset)) {
+                                saveOffset.Set(&threadCurrentKeys[i]);
+                                foundActive = true;
+                            }
                         }
                     }
+                    if (!foundActive) saveOffset.Set(&startRange);
 
                     std::vector<std::string> targetStrs;
                     for (const auto& t : targetHash160s) {
                         targetStrs.push_back(bytesToHex(t.data(), 20));
                     }
 
-                    scheduler->saveProgress(progressFile, scanMode, currentMapId, saveOffset,
+                    scheduler->saveProgress(progressFile, scanMode, currentMapId.load(), saveOffset,
                                            intToHex(startRange), intToHex(endRange), targetStrs);
                     lastSave = nowSteady;
                 }
 
-                system("clear");
+                // FIX #8: Use ANSI escape instead of system("clear") for portability
+                std::cout << "\033[2J\033[H";
+                
+                // FIX #15: Show N/A when estimate is impossible
+                std::string estStr = (mapsPerSec > 0.0 && remaining > 0) 
+                                     ? formatElapsedTime(estRemainingSec) 
+                                     : "N/A";
+
                 std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
                           << "║         BTC PUZZLE HUNTER v4.0 - MAP SCHEDULER               ║\n"
                           << "╠══════════════════════════════════════════════════════════════╣\n"
@@ -728,7 +765,7 @@ public:
                           << "╠══════════════════════════════════════════════════════════════╣\n"
                           << "║ SYSTEM                                                       ║\n"
                           << "║ Memory:      " << std::setw(15) << memUsage << "             ║\n"
-                          << "║ Est. Remain: " << std::setw(10) << formatElapsedTime(estRemainingSec) << "                  ║\n"
+                          << "║ Est. Remain: " << std::setw(10) << estStr << "                  ║\n"
                           << "║ Refresh:     " << std::setw(6) << statIntervalMs << " ms" << std::setw(18) << ""
                           << thermalStatus << std::setw(20 - thermalStatus.length()) << "║\n"
                           << "╚══════════════════════════════════════════════════════════════╝\n";
@@ -746,10 +783,11 @@ public:
         for (const auto& t : targetHash160s) targetStrs.push_back(bytesToHex(t.data(), 20));
         Int finalOffset;
         finalOffset.Set(&endRange);
-        scheduler->saveProgress(progressFile, scanMode, currentMapId, finalOffset,
+        scheduler->saveProgress(progressFile, scanMode, currentMapId.load(), finalOffset,
                                intToHex(startRange), intToHex(endRange), targetStrs);
 
-        system("clear");
+        // FIX #8: ANSI clear
+        std::cout << "\033[2J\033[H";
         if (g_matchesFound.load() > 0) {
             std::cout << "╔══════════════════════════════════════════════════════════════╗\n"
                       << "║                    MATCH FOUND!                              ║\n"
@@ -810,10 +848,12 @@ int main(int argc, char* argv[]) {
 
     bool resumed = hunter.checkResume(args.startRange, args.endRange, args.targetHash160s);
 
+    // FIX #16: Do NOT re-initialize if we successfully resumed.
+    // Re-initialization would overwrite the loaded bitmap and lose progress.
     if (!resumed) {
         hunter.initialize();
     } else {
-        hunter.initialize();
+        std::cout << "[MAIN] Resuming from saved progress, skipping fresh initialization.\n";
     }
 
     std::cout << "Starting optimized search...\n";
