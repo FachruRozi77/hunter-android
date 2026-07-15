@@ -13,40 +13,37 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
- */
+*/
 
 #include "Random.h"
-#include <random>
-#include <mutex>
 
-#define RK_STATE_LEN 624
+#define  RK_STATE_LEN 624
 
 /* State of the RNG */
 typedef struct rk_state_
 {
-unsigned long key[RK_STATE_LEN];
-int pos;
+  unsigned long key[RK_STATE_LEN];
+  int pos;
 } rk_state;
 
 rk_state localState;
-static bool seeded = false;
 
 /* Maximum generated random value */
 #define RK_MAX 0xFFFFFFFFUL
 
 void rk_seed(unsigned long seed, rk_state *state)
 {
-int pos;
-seed &= 0xffffffffUL;
+  int pos;
+  seed &= 0xffffffffUL;
 
-/* Knuth's PRNG as used in the Mersenne Twister reference implementation */
-for (pos=0; pos<RK_STATE_LEN; pos++)
-{
-state->key[pos] = seed;
-seed = (1812433253UL * (seed ^ (seed >> 30)) + pos + 1) & 0xffffffffUL;
-}
+  /* Knuth's PRNG as used in the Mersenne Twister reference implementation */
+  for (pos=0; pos<RK_STATE_LEN; pos++)
+  {
+    state->key[pos] = seed;
+    seed = (1812433253UL * (seed ^ (seed >> 30)) + pos + 1) & 0xffffffffUL;
+  }
 
-state->pos = RK_STATE_LEN;
+  state->pos = RK_STATE_LEN;
 }
 
 /* Magic Mersenne Twister constants */
@@ -59,79 +56,57 @@ state->pos = RK_STATE_LEN;
 /* Slightly optimised reference implementation of the Mersenne Twister */
 inline unsigned long rk_random(rk_state *state)
 {
-unsigned long y;
+  unsigned long y;
 
-if (state->pos == RK_STATE_LEN)
-{
-int i;
+  if (state->pos == RK_STATE_LEN)
+  {
+    int i;
 
-for (i=0;i<N-M;i++)
-{
-y = (state->key[i] & UPPER_MASK) | (state->key[i+1] & LOWER_MASK);
-state->key[i] = state->key[i+M] ^ (y>>1) ^ (-(y & 1) & MATRIX_A);
-}
-for (;i<N-1;i++)
-{
-y = (state->key[i] & UPPER_MASK) | (state->key[i+1] & LOWER_MASK);
-state->key[i] = state->key[i+(M-N)] ^ (y>>1) ^ (-(y & 1) & MATRIX_A);
-}
-y = (state->key[N-1] & UPPER_MASK) | (state->key[0] & LOWER_MASK);
-state->key[N-1] = state->key[M-1] ^ (y>>1) ^ (-(y & 1) & MATRIX_A);
+    for (i=0;i<N-M;i++)
+    {
+      y = (state->key[i] & UPPER_MASK) | (state->key[i+1] & LOWER_MASK);
+      state->key[i] = state->key[i+M] ^ (y>>1) ^ (-(y & 1) & MATRIX_A);
+    }
+    for (;i<N-1;i++)
+    {
+      y = (state->key[i] & UPPER_MASK) | (state->key[i+1] & LOWER_MASK);
+      state->key[i] = state->key[i+(M-N)] ^ (y>>1) ^ (-(y & 1) & MATRIX_A);
+    }
+    y = (state->key[N-1] & UPPER_MASK) | (state->key[0] & LOWER_MASK);
+    state->key[N-1] = state->key[M-1] ^ (y>>1) ^ (-(y & 1) & MATRIX_A);
 
-state->pos = 0;
-}
+    state->pos = 0;
+  }
 
-y = state->key[state->pos++];
+  y = state->key[state->pos++];
 
-/* Tempering */
-y ^= (y >> 11);
-y ^= (y << 7) & 0x9d2c5680UL;
-y ^= (y << 15) & 0xefc60000UL;
-y ^= (y >> 18);
+  /* Tempering */
+  y ^= (y >> 11);
+  y ^= (y << 7) & 0x9d2c5680UL;
+  y ^= (y << 15) & 0xefc60000UL;
+  y ^= (y >> 18);
 
-return y;
+  return y;
 }
 
 inline double rk_double(rk_state *state)
 {
-/* shifts : 67108864 = 0x4000000, 9007199254740992 = 0x20000000000000 */
-long a = rk_random(state) >> 5, b = rk_random(state) >> 6;
-return (a * 67108864.0 + b) / 9007199254740992.0;
+  /* shifts : 67108864 = 0x4000000, 9007199254740992 = 0x20000000000000 */
+  long a = rk_random(state) >> 5, b = rk_random(state) >> 6;
+  return (a * 67108864.0 + b) / 9007199254740992.0;
 }
 
 // Initialise the random generator with the specified seed
 void rseed(unsigned long seed) {
-rk_seed(seed,&localState);
-seeded = true;
-}
-
-// Auto-seed from a real entropy source on first use. This is the actual
-// fix: previously nothing in this codebase ever called rseed(), so
-// localState (a global, zero-initialized by default) kept pos == 0
-// instead of RK_STATE_LEN. rk_random() only regenerates its internal
-// state when pos == RK_STATE_LEN, so that check silently never fired for
-// the first 624 calls, and rndl() just handed back raw zeros straight
-// out of a key[] array that had never been seeded. Int::Rand() (and
-// anything built on it, e.g. Int::Check()'s self-test) got a stream of
-// exact zeros as a result - nothing to do with Div() itself.
-static std::once_flag autoSeedFlag;
-static void EnsureSeeded() {
-if (seeded) return;
-std::call_once(autoSeedFlag, []() {
-std::random_device rd;
-unsigned long seed = ((unsigned long)rd() << 32) ^ (unsigned long)rd();
-rk_seed(seed, &localState);
-seeded = true;
-});
+  rk_seed(seed,&localState);
+  //srand(seed);
 }
 
 unsigned long rndl() {
-EnsureSeeded();
-return rk_random(&localState);
+  return rk_random(&localState);
 }
 
 // Returns a uniform distributed double value in the interval ]0,1[
 double rnd() {
-EnsureSeeded();
-return rk_double(&localState);
+  return rk_double(&localState);
 }

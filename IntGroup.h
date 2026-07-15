@@ -13,7 +13,7 @@
  *
  * You should have received a copy of the GNU General Public License
  * along with this program. If not, see <http://www.gnu.org/licenses/>.
- */
+*/
 
 #ifndef INTGROUPH
 #define INTGROUPH
@@ -25,16 +25,16 @@ class IntGroup {
 
 public:
 
-IntGroup(int size);
-~IntGroup();
-void Set(Int *pts);
-void ModInv();
+	IntGroup(int size);
+	~IntGroup();
+	void Set(Int *pts);
+	void ModInv();
 
 private:
 
-Int *ints;
-Int *subp;
-int size;
+	Int *ints;
+  Int *subp;
+  int size;
 
 };
 
