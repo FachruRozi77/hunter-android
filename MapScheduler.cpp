@@ -90,7 +90,10 @@ void MapScheduler::computeMapRanges(const Int& totalElements) {
     // Use integer square root instead of double to prevent precision loss
     Int sqrtInt = integerSqrt(totalElements);
     uint64_t n = 1;
-    if (sqrtInt.GetBitLength() <= 64) {
+    // FIX: Use mutable copy to call non-const GetBitLength()
+    Int sqrtCopy;
+    sqrtCopy.Set(&sqrtInt);
+    if (sqrtCopy.GetBitLength() <= 64) {
         n = sqrtInt.bits64[0];
     } else {
         n = 0xFFFFFFFFFFFFFFFFULL;
@@ -222,7 +225,10 @@ uint64_t MapScheduler::getRemainingMaps() const {
 }
 
 uint64_t MapScheduler::getMapSize() const {
-    if (mapSize.GetBitLength() <= 64) {
+    // FIX: Use mutable copy to call non-const GetBitLength()
+    Int mapSizeCopy;
+    mapSizeCopy.Set(const_cast<Int*>(&mapSize));
+    if (mapSizeCopy.GetBitLength() <= 64) {
         return mapSize.bits64[0];
     }
     return 0xFFFFFFFFFFFFFFFFULL;
