@@ -504,7 +504,7 @@ public:
         std::cout << "[SCHEDULER] Mode:       " << (scanMode == ScanMode::SEQUENTIAL ? "Sequential" : "Random") << "\n";
     }
 
-    bool checkResume(const std::string& startHex, const std::string& endHex,
+        bool checkResume(const std::string& startHex, const std::string& endHex,
                      const std::vector<std::string>& targetHashes) {
         std::ifstream test("Progress.dat");
         if (!test.good()) return false;
@@ -549,12 +549,13 @@ public:
         currentOffset.Set(&loadedOffset);
         scheduler->setMode(loadedMode);
 
-        std::cout << "[RESUME] Restored: Map " << loadedMapId
-                  << ", Offset " << intToHex(loadedOffset) << "\n";
+        std::cout << "[RESUME] Restored: " << scheduler->getCompletedMaps() << " / " 
+                  << scheduler->getTotalMaps() << " maps finished.\n";
+        std::cout << "[RESUME] Mode: " << (loadedMode == ScanMode::SEQUENTIAL ? "Sequential" : "Random") << "\n";
         return true;
     }
 
-    void workerThread(int tid, ThreadStats& stats) {
+        void workerThread(int tid, ThreadStats& stats) {
         setThreadAffinity(tid);
 
         FastRandom rng((uint64_t)(tid + 1) * 0x9e3779b97f4a7c15ULL +
@@ -671,7 +672,13 @@ public:
         g_totalCandidates.fetch_add(localCandidates, std::memory_order_relaxed);
 
         if (hasMap) {
-            scheduler->finishMap(currentMap.id);
+            // If we exited early (match found or shutdown), unassign so another
+            // worker can pick it up. If finished normally, finishMap was already called.
+            if (g_matchFound.load() || g_shutdownRequested.load()) {
+                scheduler->unassignMap(currentMap.id);
+            } else {
+                scheduler->finishMap(currentMap.id);
+            }
         }
     }
 
