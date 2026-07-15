@@ -6,27 +6,29 @@
 #include <algorithm>
 
 // Integer square root for Int class (Newton's method)
-// Used instead of double sqrt() to avoid precision loss on 256-bit values.
-// NOTE: Int methods are not const-correct, so n is passed by non-const reference.
-static Int integerSqrt(Int& n) {
-    if (n.IsZero() || n.IsOne()) {
-        Int r; r.Set(&n); return r;
+// Operates on mutable copies since Int API uses non-const pointers
+static Int integerSqrt(const Int& n) {
+    Int nCopy;
+    nCopy.Set(const_cast<Int*>(&n));
+    
+    if (nCopy.IsZero() || nCopy.IsOne()) {
+        return nCopy;
     }
     
-    Int x; 
-    x.Set(&n);
+    Int x;
+    x.Set(&nCopy);
     x.ShiftR(1);  // x = n / 2
     
-    Int two; 
+    Int two;
     two.SetInt32(2);
     
-    Int last; 
+    Int last;
     last.Set(&x);
     
     for (int iter = 0; iter < 300; ++iter) {
         // q = n / x
         Int q, rmd;
-        q.Set(&n);
+        q.Set(&nCopy);
         q.Div(&x, &rmd);
         
         // sum = x + q
@@ -40,7 +42,7 @@ static Int integerSqrt(Int& n) {
             // Verify floor sqrt: if sum*sum > n, decrement
             Int sq;
             sq.Mult(&sum, &sum);
-            if (sq.IsGreater(&n)) {
+            if (sq.IsGreater(&nCopy)) {
                 sum.SubOne();
             }
             return sum;
@@ -52,7 +54,7 @@ static Int integerSqrt(Int& n) {
     // Fallback verification
     Int sq;
     sq.Mult(&x, &x);
-    if (sq.IsGreater(&n)) x.SubOne();
+    if (sq.IsGreater(&nCopy)) x.SubOne();
     return x;
 }
 
@@ -62,17 +64,16 @@ MapScheduler::~MapScheduler() {}
 
 void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
     std::lock_guard<std::mutex> lock(schedulerMutex);
-    startRange = start;
-    endRange = end;
+    startRange.Set(const_cast<Int*>(&start));
+    endRange.Set(const_cast<Int*>(&end));
 
     Int totalElements;
-    totalElements.Set(&endRange);
-    totalElements.Sub(&startRange);
+    totalElements.Sub(const_cast<Int*>(&end), const_cast<Int*>(&start));
     totalElements.AddOne();
 
     computeMapRanges(totalElements);
     
-    // FIX #13: Apply bitmap loaded from progress file now that mapRanges exist
+    // Apply bitmap loaded from progress file now that mapRanges exist
     if (!pendingBitmap.empty()) {
         if (pendingBitmap.size() == finishedBitmap.size()) {
             restoreFinishedBitmap(pendingBitmap);
@@ -85,8 +86,8 @@ void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
     }
 }
 
-void MapScheduler::computeMapRanges(Int& totalElements) {
-    // FIX #3: Use integer square root instead of double to prevent precision loss
+void MapScheduler::computeMapRanges(const Int& totalElements) {
+    // Use integer square root instead of double to prevent precision loss
     Int sqrtInt = integerSqrt(totalElements);
     uint64_t n = 1;
     if (sqrtInt.GetBitLength() <= 64) {
@@ -100,7 +101,7 @@ void MapScheduler::computeMapRanges(Int& totalElements) {
     mapSize.SetQWord(0, n);
 
     Int temp;
-    temp.Set(&totalElements);
+    temp.Set(const_cast<Int*>(&totalElements));
     temp.Add(&mapSize);
     temp.SubOne();
     Int mapCountInt;
@@ -154,7 +155,7 @@ bool MapScheduler::getNextSequentialMap(MapRange& out) {
     return false;
 }
 
-// FIX #6: Eliminate per-call vector allocation; scan-forward from random start
+// Eliminate per-call vector allocation; scan-forward from random start
 bool MapScheduler::getRandomMap(MapRange& out, FastRandom& rng) {
     std::lock_guard<std::mutex> lock(schedulerMutex);
 
@@ -221,9 +222,7 @@ uint64_t MapScheduler::getRemainingMaps() const {
 }
 
 uint64_t MapScheduler::getMapSize() const {
-    Int temp;
-    temp.Set(&mapSize);
-    if (temp.GetBitLength() <= 64) {
+    if (mapSize.GetBitLength() <= 64) {
         return mapSize.bits64[0];
     }
     return 0xFFFFFFFFFFFFFFFFULL;
@@ -251,14 +250,12 @@ bool MapScheduler::saveProgress(const std::string& filename, ScanMode saveMode,
     fs << "StartRange=" << startRange.GetBase16() << "\n";
     fs << "EndRange=" << endRange.GetBase16() << "\n";
     fs << "MapCount=" << totalMaps << "\n";
-    Int temp;
-    temp.Set(&mapSize);
-    fs << "Interval=" << temp.GetBitLength() << "\n";
+    fs << "Interval=" << getMapSize() << "\n";
     fs << "CompletedMaps=" << getCompletedMaps() << "\n";
     fs << "CurrentMap=" << currentMapId << "\n";
     
     Int offsetCopy;
-    offsetCopy.Set(&currentOffset);
+    offsetCopy.Set(const_cast<Int*>(&currentOffset));
     fs << "CurrentOffset=" << offsetCopy.GetBase16() << "\n";
 
     fs << "Bitmap=";
@@ -308,7 +305,7 @@ bool MapScheduler::loadProgress(const std::string& filename, ScanMode& loadMode,
         } else if (key == "CurrentOffset") {
             currentOffset.SetBase16(const_cast<char*>(val.c_str()));
         } else if (key == "Bitmap") {
-            // FIX #13: Store in pendingBitmap to be applied after initializeMapRanges
+            // Store in pendingBitmap to be applied after initializeMapRanges
             pendingBitmap.clear();
             for (char c : val) {
                 pendingBitmap.push_back(c == '1');
