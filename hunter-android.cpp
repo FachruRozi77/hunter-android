@@ -53,8 +53,8 @@
 // CONFIGURATION
 // ============================================================================
 
-static constexpr int POINTS_BATCH_SIZE = 4096;
-static constexpr int HASH_BATCH_SIZE = 64;
+static constexpr int POINTS_BATCH_SIZE = 256;
+static constexpr int HASH_BATCH_SIZE = 8;
 static constexpr int SAVE_INTERVAL_SEC = 60;
 static constexpr int DEFAULT_STAT_INTERVAL_MS = 30000;
 // FIX #14: BLOOM_FILTER_BITS is now the actual BIT count (not byte count).
