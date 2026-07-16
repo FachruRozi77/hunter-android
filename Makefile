@@ -4,7 +4,7 @@
 CXX = clang++
 CXXFLAGS = -O3 -flto -fomit-frame-pointer -funroll-loops \
            -march=armv8-a+crc+crypto -mtune=native \
-           -DNDEBUG -Wall -Wextra -fprofile-use=default_10523561941421258937_0.profraw
+           -DNDEBUG -Wall -Wextra -fprofile-use=hunter.profdata
 LDFLAGS = -lpthread -lcrypto -lssl -lm
 
 # Source files - NEW files added
