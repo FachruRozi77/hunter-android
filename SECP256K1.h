@@ -50,6 +50,13 @@ public:
     Point Double(Point &p);
     Point DoubleDirect(Point &p);
 
+    // Fused generator-addition kernel: r = p + G  (Jacobian + affine mixed add).
+    // The second operand is always the generator (affine, z==1), so all
+    // generic branches, indirection and temporary Int construction are removed.
+    // scratch must point to at least ADD_GEN_SCRATCH Int temporaries.
+    static constexpr int ADD_GEN_SCRATCH = 11;
+    void PointAddGenerator(const Point &p, Point &r, Int *scratch);
+
     Point G; // Generator
     Int order; // Curve order
 
