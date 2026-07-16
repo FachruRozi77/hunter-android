@@ -197,7 +197,7 @@ Point Secp256K1::DoubleDirect(Point &p) {
   _s.ModMulK1(&_p,&a);     // s = (3*pow2(p.x))*inverse(2*p.y);
 
   _p.ModMulK1(&_s,&_s);
-  a.ModAdd(&p.x,&p.x);
+    a.ModAdd(&p.x,&p.x);
   a.ModNeg();
   r.x.ModAdd(&a,&_p);    // rx = pow2(s) + neg(2*p.x);
 
@@ -237,6 +237,49 @@ Point Secp256K1::ComputePublicKey(Int *privKey) {
 
 }
 
+// Fused mixed-addition kernel: r = p + G  (Jacobian + affine).
+// The second operand is always the generator, so all generic indirection,
+// equality checks, and stack-allocated Int temporaries are removed.
+// scratch must point to at least ADD_GEN_SCRATCH Ints (no construction).
+__attribute__((always_inline))
+void Secp256K1::PointAddGenerator(const Point &p1, Point &r, Int *s) {
+    // s[0] = u1 = G.y * p1.z
+    s[0].ModMulK1(&G.y, &p1.z);
+    // s[1] = v1 = G.x * p1.z
+    s[1].ModMulK1(&G.x, &p1.z);
+    // s[2] = u = u1 - p1.y
+    s[2].ModSub(&s[0], &p1.y);
+    // s[3] = v = v1 - p1.x
+    s[3].ModSub(&s[1], &p1.x);
+    // s[4] = us2 = u^2
+    s[4].ModSquareK1(&s[2]);
+    // s[5] = vs2 = v^2
+    s[5].ModSquareK1(&s[3]);
+    // s[6] = vs3 = vs2 * v
+    s[6].ModMulK1(&s[5], &s[3]);
+    // s[7] = us2w = us2 * p1.z
+    s[7].ModMulK1(&s[4], &p1.z);
+    // s[8] = vs2v2 = vs2 * p1.x
+    s[8].ModMulK1(&s[5], &p1.x);
+    // s[9] = _2vs2v2 = vs2v2 + vs2v2
+    s[9].ModAdd(&s[8], &s[8]);
+    // a = us2w - vs3 - _2vs2v2  (reuse s[7])
+    s[7].ModSub(&s[7], &s[6]);
+    s[7].ModSub(&s[7], &s[9]);
+    // r.x = v * a
+    r.x.ModMulK1(&s[3], &s[7]);
+    // s[9] = vs3u2 = vs3 * p1.y
+    s[9].ModMulK1(&s[6], &p1.y);
+    // s[8] = vs2v2 - a  (reuse s[8])
+    s[8].ModSub(&s[8], &s[7]);
+    // s[8] = (vs2v2 - a) * u
+    s[8].ModMulK1(&s[8], &s[2]);
+    // r.y = s[8] - vs3u2
+    r.y.ModSub(&s[8], &s[9]);
+    // r.z = vs3 * p1.z
+    r.z.ModMulK1(&s[6], &p1.z);
+}
+
 void Secp256K1::ComputePublicKeyBatch(Int *privKeys, int count, Point *pubKeys) {
 
   if (count <= 0) return;
@@ -267,9 +310,15 @@ void Secp256K1::ComputePublicKeyBatch(Int *privKeys, int count, Point *pubKeys) 
 
   // Phase 2: Incremental mixed addition (+G) for remaining keys.
   // The MapScheduler guarantees privKeys are sequential: k, k+1, k+2...
-  // Therefore (k+1)*G = k*G + G.  G is affine (z=1), so Add2 is valid.
+  // Therefore (k+1)*G = k*G + G.  G is affine (z=1).
+  //
+  // AUDIT: No Reduce() or ModInv() is called inside this hot loop.
+  // All points remain in Jacobian coordinates until the single batch
+  // inversion in Phase 3.  This matches the original design and avoids
+  // the ~40-instruction normalization cost per key.
+  static thread_local Int addGenScratch[ADD_GEN_SCRATCH];
   for (int k = 1; k < count; k++) {
-    pubKeys[k] = Add2(pubKeys[k - 1], G);
+    PointAddGenerator(pubKeys[k - 1], pubKeys[k], addGenScratch);
   }
 
   // Phase 3: Batch modular inversion of all Z coordinates.
