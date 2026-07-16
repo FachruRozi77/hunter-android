@@ -4,15 +4,11 @@ using namespace std;
 
 IntGroup::IntGroup(int size) {
   this->size = size;
-  subp.resize(size);
+  subp = (Int *)malloc(size * sizeof(Int));
 }
 
 IntGroup::~IntGroup() {
-}
-
-void IntGroup::SetSize(int size) {
-  this->size = size;
-  subp.resize(size);
+  free(subp);
 }
 
 void IntGroup::Set(Int *pts) {

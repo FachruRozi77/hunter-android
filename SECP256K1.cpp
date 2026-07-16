@@ -16,8 +16,8 @@
 */
 
 #include "SECP256K1.h"
+#include "IntGroup.h"
 #include <string.h>
-#include <vector>
 
 Secp256K1::Secp256K1() {
 }
@@ -241,70 +241,49 @@ void Secp256K1::ComputePublicKeyBatch(Int *privKeys, int count, Point *pubKeys) 
 
   if (count <= 0) return;
 
-  // Phase 1: Compute first key with full windowed scalar multiplication.
-  // We intentionally skip Reduce() so pubKeys[0] stays in Jacobian (z != 1).
-  {
+  // Phase 1: accumulate each key's public point via the same windowed-comb
+  // technique as ComputePublicKey(), but stop short of Reduce() - leave
+  // every point in Jacobian form (x,y,z) instead of paying a ModInv() here.
+  for (int k = 0; k < count; k++) {
     int i = 0;
     uint8_t b;
     Point Q;
     Q.Clear();
 
     for (i = 0; i < 32; i++) {
-      b = privKeys[0].GetByte(i);
+      b = privKeys[k].GetByte(i);
       if (b) break;
     }
     Q = GTable[256 * i + (b - 1)];
     i++;
 
     for (; i < 32; i++) {
-      b = privKeys[0].GetByte(i);
+      b = privKeys[k].GetByte(i);
       if (b)
         Q = Add2(Q, GTable[256 * i + (b - 1)]);
     }
 
-    pubKeys[0] = Q; // Jacobian
+    pubKeys[k] = Q; // still Jacobian (z generally != 1)
   }
 
-  // Phase 2: Incremental mixed addition (+G) for remaining keys.
-  // The MapScheduler guarantees privKeys are sequential: k, k+1, k+2...
-  // Therefore (k+1)*G = k*G + G.  G is affine (z=1), so Add2 is valid.
-  for (int k = 1; k < count; k++) {
-    pubKeys[k] = Add2(pubKeys[k - 1], G);
-  }
-
-  // Phase 3: Batch modular inversion of all Z coordinates.
-  // Thread-local reusable buffers eliminate per-batch heap allocation.
-  static thread_local std::vector<Int> tl_zInv;
-  static thread_local std::vector<Int> tl_subp;
-
-  tl_zInv.resize(count);
+  // Phase 2: one Montgomery batch inversion across all `count` Z
+  // coordinates at once, instead of `count` separate ModInv() calls.
+  std::vector<Int> zInv(count);
   for (int k = 0; k < count; k++)
-    tl_zInv[k].Set(&pubKeys[k].z);
+    zInv[k].Set(&pubKeys[k].z);
 
-  tl_subp.resize(count);
-  tl_subp[0].Set(&tl_zInv[0]);
-  for (int i = 1; i < count; i++) {
-    tl_subp[i].ModMulK1(&tl_subp[i - 1], &tl_zInv[i]);
-  }
+  IntGroup grp(count);
+  grp.Set(zInv.data());
+  grp.ModInv();
+  // zInv[k] now holds pubKeys[k].z^-1 (mod P) for every k.
 
-  Int inverse;
-  inverse.Set(&tl_subp[count - 1]);
-  inverse.ModInv();
-
-  for (int i = count - 1; i > 0; i--) {
-    Int newValue;
-    newValue.ModMulK1(&tl_subp[i - 1], &inverse);
-    inverse.ModMulK1(&tl_zInv[i]);
-    tl_zInv[i].Set(&newValue);
-  }
-  tl_zInv[0].Set(&inverse);
-
-  // Phase 4: Convert all Jacobian points to affine coordinates.
+  // Phase 3: convert every point back to affine using its own inverse.
   for (int k = 0; k < count; k++) {
-    pubKeys[k].x.ModMul(&pubKeys[k].x, &tl_zInv[k]);
-    pubKeys[k].y.ModMul(&pubKeys[k].y, &tl_zInv[k]);
+    pubKeys[k].x.ModMul(&pubKeys[k].x, &zInv[k]);
+    pubKeys[k].y.ModMul(&pubKeys[k].y, &zInv[k]);
     pubKeys[k].z.SetInt32(1);
   }
+
 }
 
 
