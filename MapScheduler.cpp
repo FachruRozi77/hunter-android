@@ -38,7 +38,11 @@ void CooperativeMapScheduler::initialize(const Int& start, const Int& end) {
     Int mapCountInt;
     mapCountInt.Set(&temp);
     mapCountInt.Div(&mapSize, nullptr);
-    totalMaps = mapCountInt.GetInt32();
+    if (mapCountInt.GetBitLength() <= 64) {
+        totalMaps = mapCountInt.bits64[0];
+    } else {
+        totalMaps = 0xFFFFFFFFFFFFFFFFULL;
+    }
     if (totalMaps == 0) totalMaps = 1;
 
     finishedMaps.clear();
