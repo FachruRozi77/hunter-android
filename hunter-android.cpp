@@ -434,388 +434,16 @@ static std::string getMemoryUsage() {
     return oss.str();
 }
 
-// ============================================================================
-// COOPERATIVE MAP SCHEDULER
-// ============================================================================
-// All threads work on the SAME map. When the map is exhausted, they move to
-// the next map together. This maximizes cache locality and simplifies progress
-// tracking — only one map is "active" at any time.
-
-class CooperativeMapScheduler {
-public:
-    CooperativeMapScheduler() : totalMaps(0), mode(ScanMode::SEQUENTIAL),
-        currentMapId(0), mapFinished(false), nextSequentialHint(0) {}
-
-    void initialize(const Int& start, const Int& end) {
-        std::lock_guard<std::mutex> lock(mutex);
-        startRange.Set(const_cast<Int*>(&start));
-        endRange.Set(const_cast<Int*>(&end));
-
-        Int totalElements;
-        totalElements.Sub(const_cast<Int*>(&end), const_cast<Int*>(&start));
-        totalElements.AddOne();
-
-        // Compute map size = sqrt(totalElements)
-        Int sqrtInt = integerSqrt(totalElements);
-        uint64_t n = 1;
-        Int sqrtCopy; sqrtCopy.Set(&sqrtInt);
-        if (sqrtCopy.GetBitLength() <= 64) {
-            n = sqrtInt.bits64[0];
-        } else {
-            n = 0xFFFFFFFFFFFFFFFFULL;
-        }
-        if (n < 1) n = 1;
-
-        mapSize.SetInt32(0);
-        mapSize.SetQWord(0, n);
-
-        Int temp;
-        temp.Set(const_cast<Int*>(&totalElements));
-        temp.Add(&mapSize);
-        temp.SubOne();
-        Int mapCountInt;
-        mapCountInt.Set(&temp);
-        mapCountInt.Div(&mapSize, nullptr);
-        totalMaps = mapCountInt.GetInt32();
-        if (totalMaps == 0) totalMaps = 1;
-
-        finishedMaps.clear();
-        currentMapId = 0;
-        mapFinished = false;
-        nextSequentialHint = 0;
-
-        // Compute initial current map
-        computeCurrentMap();
+static inline bool strEqualsIgnoreCase(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return false;
     }
-
-    // Get the next batch of private keys from the CURRENT shared map.
-    // Returns number of keys filled (0 if current map is exhausted).
-    // When a map is exhausted, this automatically advances to the next map.
-    int getNextBatch(Int* outKeys, int maxCount) {
-        std::lock_guard<std::mutex> lock(mutex);
-
-        // If current map is exhausted, advance to next
-        while (mapFinished || currentMapId >= totalMaps) {
-            if (currentMapId >= totalMaps) {
-                return 0; // All maps done
-            }
-            // Mark previous as finished
-            finishedMaps.insert(currentMapId);
-            // Advance to next map
-            advanceToNextMap();
-            if (currentMapId >= totalMaps) {
-                return 0;
-            }
-        }
-
-        int count = 0;
-        for (int i = 0; i < maxCount; i++) {
-            if (currentOffset.IsGreater(&currentMapEnd)) {
-                mapFinished = true;
-                finishedMaps.insert(currentMapId);
-                break;
-            }
-            outKeys[count].Set(&currentOffset);
-            count++;
-            currentOffset.AddOne();
-        }
-        return count;
-    }
-
-    // For progress display
-    uint64_t getCurrentMapId() const {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
-        return currentMapId;
-    }
-
-    uint64_t getTotalMaps() const {
-        return totalMaps;
-    }
-
-    uint64_t getCompletedMaps() const {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
-        return finishedMaps.size();
-    }
-
-    uint64_t getMapSize() const {
-        Int copy; copy.Set(const_cast<Int*>(&mapSize));
-        if (copy.GetBitLength() <= 64) return mapSize.bits64[0];
-        return 0xFFFFFFFFFFFFFFFFULL;
-    }
-
-    double getOverallPercent() const {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
-        if (totalMaps == 0) return 0.0;
-        return (double)finishedMaps.size() / (double)totalMaps * 100.0;
-    }
-
-    bool isComplete() const {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
-        return finishedMaps.size() >= totalMaps;
-    }
-
-    ScanMode getMode() const { return mode; }
-    void setMode(ScanMode m) { mode = m; }
-
-    // Compute a MapRange for display purposes
-    MapRange getCurrentMapRange() const {
-        std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
-        MapRange mr;
-        mr.id = currentMapId;
-        mr.start.Set(const_cast<Int*>(&currentMapStart));
-        mr.end.Set(const_cast<Int*>(&currentMapEnd));
-        return mr;
-    }
-
-    // Progress save/load
-    bool saveProgress(const std::string& filename, ScanMode saveMode,
-                      const Int& currentOffset,
-                      const std::string& startHex, const std::string& endHex,
-                      const std::vector<std::string>& targetHashes) {
-        std::lock_guard<std::mutex> lock(mutex);
-        std::ofstream fs(filename);
-        if (!fs) return false;
-
-        fs << "Version=4\n";
-        fs << "Mode=" << (saveMode == ScanMode::SEQUENTIAL ? "Sequential" : "Random") << "\n";
-        fs << "StartRange=" << startRange.GetBase16() << "\n";
-        fs << "EndRange=" << endRange.GetBase16() << "\n";
-        fs << "MapSize=" << getMapSize() << "\n";
-        fs << "TotalMaps=" << totalMaps << "\n";
-        fs << "CurrentMap=" << currentMapId << "\n";
-
-        Int offsetCopy;
-        offsetCopy.Set(const_cast<Int*>(&currentOffset));
-        fs << "CurrentOffset=" << offsetCopy.GetBase16() << "\n";
-
-        fs << "FinishedCount=" << finishedMaps.size() << "\n";
-        for (uint64_t id : finishedMaps) {
-            fs << "Finished=" << id << "\n";
-        }
-
-        fs << "TargetCount=" << targetHashes.size() << "\n";
-        for (const auto& h : targetHashes) {
-            fs << "Target=" << h << "\n";
-        }
-
-        fs.flush();
-        return fs.good();
-    }
-
-    bool loadProgress(const std::string& filename, ScanMode& loadMode,
-                      uint64_t& loadedCurrentMap, Int& loadedOffset,
-                      std::string& loadStartHex, std::string& loadEndHex,
-                      std::vector<std::string>& targetHashes) {
-        std::ifstream fs(filename);
-        if (!fs) return false;
-
-        std::string line;
-        std::string modeStr;
-        uint64_t loadedMapSize = 0;
-        uint64_t loadedTotalMaps = 0;
-        uint64_t loadedFinishedCount = 0;
-        uint64_t finishedRead = 0;
-
-        finishedMaps.clear();
-
-        while (std::getline(fs, line)) {
-            if (!line.empty() && line.back() == '\r') line.pop_back();
-            size_t eq = line.find('=');
-            if (eq == std::string::npos) continue;
-            std::string key = line.substr(0, eq);
-            std::string val = line.substr(eq + 1);
-
-            if (key == "Version") {
-                if (val != "4") {
-                    std::cerr << "[RESUME] Old progress file format (Version=" << val
-                              << "). Please start fresh.\n";
-                    return false;
-                }
-            } else if (key == "Mode") {
-                modeStr = val;
-            } else if (key == "StartRange") {
-                loadStartHex = val;
-                startRange.SetBase16(const_cast<char*>(val.c_str()));
-            } else if (key == "EndRange") {
-                loadEndHex = val;
-                endRange.SetBase16(const_cast<char*>(val.c_str()));
-            } else if (key == "MapSize") {
-                loadedMapSize = std::stoull(val);
-                mapSize.SetInt32(0);
-                mapSize.SetQWord(0, loadedMapSize);
-            } else if (key == "TotalMaps") {
-                loadedTotalMaps = std::stoull(val);
-                totalMaps = loadedTotalMaps;
-            } else if (key == "CurrentMap") {
-                loadedCurrentMap = std::stoull(val);
-            } else if (key == "CurrentOffset") {
-                loadedOffset.SetBase16(const_cast<char*>(val.c_str()));
-            } else if (key == "FinishedCount") {
-                loadedFinishedCount = std::stoull(val);
-            } else if (key == "Finished") {
-                finishedMaps.insert(std::stoull(val));
-                finishedRead++;
-            } else if (key == "Target") {
-                targetHashes.push_back(val);
-            }
-        }
-
-        if (finishedRead != loadedFinishedCount) {
-            std::cerr << "[RESUME] Warning: Expected " << loadedFinishedCount
-                      << " finished maps but read " << finishedRead << "\n";
-        }
-
-        // Restore state
-        currentMapId = loadedCurrentMap;
-        mode = (modeStr == "Random") ? ScanMode::RANDOM : ScanMode::SEQUENTIAL;
-        nextSequentialHint = 0;
-        while (nextSequentialHint < totalMaps &&
-               finishedMaps.find(nextSequentialHint) != finishedMaps.end()) {
-            nextSequentialHint++;
-        }
-
-        computeCurrentMap();
-        // Set offset to the loaded offset if it's within current map
-        if (!loadedOffset.IsZero() &&
-            !loadedOffset.IsLower(&currentMapStart) &&
-            !loadedOffset.IsGreater(&currentMapEnd)) {
-            currentOffset.Set(&loadedOffset);
-            mapFinished = false;
-        }
-
-        return true;
-    }
-
-private:
-    Int startRange;
-    Int endRange;
-    Int mapSize;
-    uint64_t totalMaps;
-    ScanMode mode;
-
-    // Current shared map state
-    uint64_t currentMapId;
-    Int currentMapStart;
-    Int currentMapEnd;
-    Int currentOffset;
-    bool mapFinished;
-
-    std::set<uint64_t> finishedMaps;
-    uint64_t nextSequentialHint;
-    mutable std::mutex mutex;
-
-    static Int integerSqrt(const Int& n) {
-        Int nCopy;
-        nCopy.Set(const_cast<Int*>(&n));
-        if (nCopy.IsZero() || nCopy.IsOne()) return nCopy;
-
-        Int x; x.Set(&nCopy); x.ShiftR(1);
-        Int last; last.Set(&x);
-
-        for (int iter = 0; iter < 300; ++iter) {
-            Int q, rmd;
-            q.Set(&nCopy); q.Div(&x, &rmd);
-            Int sum; sum.Add(&x, &q); sum.ShiftR(1);
-            if (sum.IsEqual(&x) || sum.IsEqual(&last)) {
-                Int sq; sq.Mult(&sum, &sum);
-                if (sq.IsGreater(&nCopy)) sum.SubOne();
-                return sum;
-            }
-            last.Set(&x);
-            x.Set(&sum);
-        }
-        Int sq; sq.Mult(&x, &x);
-        if (sq.IsGreater(&nCopy)) x.SubOne();
-        return x;
-    }
-
-    void computeCurrentMap() {
-        // Calculate start: startRange + (currentMapId * mapSize)
-        currentMapStart.Set(&startRange);
-        if (currentMapId > 0) {
-            Int offset;
-            offset.SetInt32(0);
-            offset.SetQWord(0, currentMapId);
-            offset.Mult(&offset, &mapSize);
-            currentMapStart.Add(&offset);
-        }
-
-        // Calculate end: start + mapSize - 1
-        currentMapEnd.Set(&currentMapStart);
-        currentMapEnd.Add(&mapSize);
-        currentMapEnd.SubOne();
-
-        // Clamp to global end
-        if (currentMapEnd.IsGreater(&endRange)) {
-            currentMapEnd.Set(&endRange);
-        }
-
-        currentOffset.Set(&currentMapStart);
-        mapFinished = false;
-    }
-
-    void advanceToNextMap() {
-        if (mode == ScanMode::SEQUENTIAL) {
-            // Find next unprocessed map, filling gaps
-            do {
-                currentMapId++;
-            } while (currentMapId < totalMaps &&
-                     finishedMaps.find(currentMapId) != finishedMaps.end());
-        } else {
-            // Random: pick from remaining unfinished maps
-            uint64_t remaining = totalMaps - finishedMaps.size();
-            if (remaining == 0) {
-                currentMapId = totalMaps;
-                return;
-            }
-
-            if (remaining <= 1000) {
-                std::vector<uint64_t> available;
-                for (uint64_t i = 0; i < totalMaps; i++) {
-                    if (finishedMaps.find(i) == finishedMaps.end()) {
-                        available.push_back(i);
-                    }
-                }
-                if (!available.empty()) {
-                    // Use a simple hash of time for randomness
-                    uint64_t idx = std::chrono::steady_clock::now().time_since_epoch().count() % available.size();
-                    currentMapId = available[idx];
-                } else {
-                    currentMapId = totalMaps;
-                }
-            } else {
-                // Probabilistic sampling
-                uint64_t attempts = 0;
-                bool found = false;
-                while (attempts < 1000 && !found) {
-                    uint64_t candidate = std::chrono::steady_clock::now().time_since_epoch().count() % totalMaps;
-                    if (finishedMaps.find(candidate) == finishedMaps.end()) {
-                        currentMapId = candidate;
-                        found = true;
-                    }
-                    attempts++;
-                }
-                if (!found) {
-                    // Fallback: linear scan from random start
-                    uint64_t start = std::chrono::steady_clock::now().time_since_epoch().count() % totalMaps;
-                    for (uint64_t i = 0; i < totalMaps; i++) {
-                        uint64_t candidate = (start + i) % totalMaps;
-                        if (finishedMaps.find(candidate) == finishedMaps.end()) {
-                            currentMapId = candidate;
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) currentMapId = totalMaps;
-                }
-            }
-        }
-
-        if (currentMapId < totalMaps) {
-            computeCurrentMap();
-        }
-    }
-};
+    return true;
+}
 
 // ============================================================================
 // MAIN HUNTER CLASS - COOPERATIVE MAP SCHEDULER
@@ -865,9 +493,15 @@ public:
         scheduler->setMode(mode);
     }
 
+    void initBloom() {
+        if (!bloom) {
+            bloom = std::make_unique<BloomFilter>();
+            for (const auto& target : targetHash160s) bloom->add(target.data(), 20);
+        }
+    }
+
     void initialize() {
-        bloom = std::make_unique<BloomFilter>();
-        for (const auto& target : targetHash160s) bloom->add(target.data(), 20);
+        initBloom();
         scheduler->initialize(startRange, endRange);
 
         std::cout << "[SCHEDULER] Total maps: " << scheduler->getTotalMaps() << "\n";
@@ -898,7 +532,7 @@ public:
             return false;
         }
 
-        if (loadedStart != startHex || loadedEnd != endHex) {
+        if (!strEqualsIgnoreCase(loadedStart, startHex) || !strEqualsIgnoreCase(loadedEnd, endHex)) {
             std::cout << "[RESUME] Range mismatch! Saved: " << loadedStart << "-" << loadedEnd
                       << " Current: " << startHex << "-" << endHex << "\n";
             return false;
@@ -909,7 +543,7 @@ public:
             return false;
         }
         for (size_t i = 0; i < loadedTargets.size(); i++) {
-            if (loadedTargets[i] != targetHashes[i]) {
+            if (!strEqualsIgnoreCase(loadedTargets[i], targetHashes[i])) {
                 std::cout << "[RESUME] Target hash mismatch at index " << i << "\n";
                 return false;
             }
@@ -922,6 +556,8 @@ public:
                   << ", Offset " << intToHex(loadedOffset) << "\n";
         std::cout << "[RESUME] Completed: " << scheduler->getCompletedMaps() << " / "
                   << scheduler->getTotalMaps() << " maps\n";
+
+        initBloom();
         return true;
     }
 
@@ -936,7 +572,6 @@ public:
         unsigned long long localChecked = 0, localCandidates = 0;
 
         while (!g_matchFound.load(std::memory_order_relaxed) && !g_shutdownRequested.load()) {
-            // Thermal pause check
             if (thermalMonitor && thermalMonitor->isPaused()) {
                 g_thermalPaused.store(true);
                 thermalMonitor->waitForResume();
@@ -944,13 +579,10 @@ public:
             }
             g_thermalPaused.store(false);
 
-            // Get next batch from the CURRENT shared map
             int batchCount = scheduler->getNextBatch(batchPrivKeys.data(), POINTS_BATCH_SIZE);
 
             if (batchCount == 0) {
-                // All maps complete
                 if (scheduler->isComplete()) break;
-                // Map switching, brief yield
                 std::this_thread::yield();
                 continue;
             }
@@ -1043,10 +675,7 @@ public:
 
                 auto nowSteady = std::chrono::steady_clock::now();
                 if (std::chrono::duration_cast<std::chrono::seconds>(nowSteady - lastSave).count() >= SAVE_INTERVAL_SEC) {
-                    // Save progress: current map + offset within that map
-                    MapRange currentMap = scheduler->getCurrentMapRange();
-                    Int saveOffset;
-                    saveOffset.Set(&currentMap.start); // Default to map start
+                    Int saveOffset = scheduler->getCurrentOffset();
 
                     std::vector<std::string> targetStrs;
                     for (const auto& t : targetHash160s) {
