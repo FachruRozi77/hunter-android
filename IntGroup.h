@@ -29,12 +29,13 @@ public:
 	~IntGroup();
 	void Set(Int *pts);
 	void ModInv();
+	void SetSize(int size);  // resize without realloc when shrinking
 
 private:
 
 	Int *ints;
-  Int *subp;
-  int size;
+	std::vector<Int> subp;
+	int size;
 
 };
 
