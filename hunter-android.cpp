@@ -53,7 +53,7 @@
 // CONFIGURATION
 // ============================================================================
 
-static constexpr int POINTS_BATCH_SIZE = 1024;   // CHANGED: was 256
+static constexpr int POINTS_BATCH_SIZE = 2048;   // CHANGED: was 256
 static constexpr int HASH_BATCH_SIZE = 8;
 static constexpr int SAVE_INTERVAL_SEC = 60;
 static constexpr int DEFAULT_STAT_INTERVAL_MS = 30000;
