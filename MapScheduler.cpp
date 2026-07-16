@@ -1,58 +1,22 @@
 #include "MapScheduler.h"
-#include "FastRandom.h"
-#include <fstream>
-#include <sstream>
-#include <iostream>
-#include <algorithm>
+#include <chrono>
 
-// Integer square root for Int class (Newton's method)
-static Int integerSqrt(const Int& n) {
-    Int nCopy;
-    nCopy.Set(const_cast<Int*>(&n));
-    
-    if (nCopy.IsZero() || nCopy.IsOne()) {
-        return nCopy;
-    }
-    
-    Int x;
-    x.Set(&nCopy);
-    x.ShiftR(1);
-    
-    Int last;
-    last.Set(&x);
-    
-    for (int iter = 0; iter < 300; ++iter) {
-        Int q, rmd;
-        q.Set(&nCopy);
-        q.Div(&x, &rmd);
-        
-        Int sum;
-        sum.Add(&x, &q);
-        sum.ShiftR(1);
-        
-        if (sum.IsEqual(&x) || sum.IsEqual(&last)) {
-            Int sq;
-            sq.Mult(&sum, &sum);
-            if (sq.IsGreater(&nCopy)) {
-                sum.SubOne();
-            }
-            return sum;
-        }
-        last.Set(&x);
-        x.Set(&sum);
-    }
-    
-    Int sq;
-    sq.Mult(&x, &x);
-    if (sq.IsGreater(&nCopy)) x.SubOne();
-    return x;
-}
+CooperativeMapScheduler::CooperativeMapScheduler()
+    : totalMaps(0), mode(ScanMode::SEQUENTIAL),
+      currentMapId(0), mapFinished(false), nextSequentialHint(0) {}
 
-MapScheduler::MapScheduler() : totalMaps(0), mode(ScanMode::SEQUENTIAL), nextSequentialHint(0) {}
+CooperativeMapScheduler::~CooperativeMapScheduler() {}
 
-MapScheduler::~MapScheduler() {}
+void CooperativeMapScheduler::initialize(const Int& start, const Int& end) {
+    std::lock_guard<std::mutex> lock(mutex);
+    startRange.Set(const_cast<Int*>(&start));
+    endRange.Set(const_cast<Int*>(&end));
 
-void MapScheduler::computeMapRanges(const Int& totalElements) {
+    Int totalElements;
+    totalElements.Sub(const_cast<Int*>(&end), const_cast<Int*>(&start));
+    totalElements.AddOne();
+
+    // Compute map size = sqrt(totalElements)
     Int sqrtInt = integerSqrt(totalElements);
     uint64_t n = 1;
     Int sqrtCopy;
@@ -76,241 +40,115 @@ void MapScheduler::computeMapRanges(const Int& totalElements) {
     mapCountInt.Div(&mapSize, nullptr);
     totalMaps = mapCountInt.GetInt32();
     if (totalMaps == 0) totalMaps = 1;
-}
 
-void MapScheduler::initializeMapRanges(const Int& start, const Int& end) {
-    std::lock_guard<std::mutex> lock(schedulerMutex);
-    startRange.Set(const_cast<Int*>(&start));
-    endRange.Set(const_cast<Int*>(&end));
-
-    Int totalElements;
-    totalElements.Sub(const_cast<Int*>(&end), const_cast<Int*>(&start));
-    totalElements.AddOne();
-
-    computeMapRanges(totalElements);
+    finishedMaps.clear();
+    currentMapId = 0;
+    mapFinished = false;
     nextSequentialHint = 0;
+
+    computeCurrentMap();
 }
 
-MapRange MapScheduler::computeMapRange(uint64_t mapId) const {
-    MapRange mr;
-    mr.id = mapId;
-    
-    // Calculate start: startRange + (mapId * mapSize)
-    mr.start.Set(const_cast<Int*>(&startRange));
-    
-    if (mapId > 0) {
-        Int offset;
-        offset.SetInt32(0);
-        offset.SetQWord(0, mapId);
-        offset.Mult(&offset, const_cast<Int*>(&mapSize));
-        mr.start.Add(&offset);
-    }
-    
-    // Calculate end: start + mapSize - 1
-    mr.end.Set(&mr.start);
-    mr.end.Add(const_cast<Int*>(&mapSize));
-    mr.end.SubOne();
-    
-    // Clamp to global end
-    if (mr.end.IsGreater(const_cast<Int*>(&endRange))) {
-        mr.end.Set(const_cast<Int*>(&endRange));
-    }
-    
-    mr.finished = false;
-    mr.assigned = false;
-    mr.checked = 0;
-    
-    return mr;
-}
+int CooperativeMapScheduler::getNextBatch(Int* outKeys, int maxCount) {
+    std::lock_guard<std::mutex> lock(mutex);
 
-uint64_t MapScheduler::findNextSequentialMapId() {
-    // Find the smallest map ID that is neither finished nor assigned
-    // This naturally fills gaps in the finished sequence
-    
-    uint64_t candidate = nextSequentialHint;
-    while (candidate < totalMaps) {
-        if (finishedMaps.find(candidate) == finishedMaps.end() &&
-            assignedMaps.find(candidate) == assignedMaps.end()) {
-            nextSequentialHint = candidate + 1;
-            return candidate;
+    while (mapFinished || currentMapId >= totalMaps) {
+        if (currentMapId >= totalMaps) {
+            return 0;
         }
-        candidate++;
-    }
-    
-    // If we reached the end, scan from beginning to find any gaps
-    for (uint64_t i = 0; i < totalMaps; i++) {
-        if (finishedMaps.find(i) == finishedMaps.end() &&
-            assignedMaps.find(i) == assignedMaps.end()) {
-            nextSequentialHint = i + 1;
-            return i;
+        finishedMaps.insert(currentMapId);
+        advanceToNextMap();
+        if (currentMapId >= totalMaps) {
+            return 0;
         }
     }
-    
-    return totalMaps; // No maps available
-}
 
-bool MapScheduler::getNextSequentialMap(MapRange& out) {
-    std::lock_guard<std::mutex> lock(schedulerMutex);
-    
-    uint64_t mapId = findNextSequentialMapId();
-    if (mapId >= totalMaps) {
-        return false;
-    }
-    
-    assignedMaps.insert(mapId);
-    out = computeMapRange(mapId);
-    out.assigned = true;
-    return true;
-}
-
-bool MapScheduler::getRandomMap(MapRange& out, FastRandom& rng) {
-    std::lock_guard<std::mutex> lock(schedulerMutex);
-    
-    // Inline remaining calculation to avoid recursive mutex deadlock
-    uint64_t remaining = totalMaps - finishedMaps.size() - assignedMaps.size();
-    if (remaining == 0) return false;
-    
-    // If remaining is small, enumerate and pick
-    if (remaining <= 1000) {
-        std::vector<uint64_t> available;
-        available.reserve(remaining);
-        for (uint64_t i = 0; i < totalMaps; i++) {
-            if (finishedMaps.find(i) == finishedMaps.end() &&
-                assignedMaps.find(i) == assignedMaps.end()) {
-                available.push_back(i);
-                if (available.size() >= remaining) break;
-            }
+    int count = 0;
+    for (int i = 0; i < maxCount; i++) {
+        if (currentOffset.IsGreater(&currentMapEnd)) {
+            mapFinished = true;
+            finishedMaps.insert(currentMapId);
+            break;
         }
-        if (available.empty()) return false;
-        uint64_t idx = rng.next() % available.size();
-        uint64_t mapId = available[idx];
-        assignedMaps.insert(mapId);
-        out = computeMapRange(mapId);
-        out.assigned = true;
-        return true;
+        outKeys[count].Set(&currentOffset);
+        count++;
+        currentOffset.AddOne();
     }
-    
-    // For large remaining, use probabilistic sampling
-    uint64_t attempts = 0;
-    const uint64_t maxAttempts = 1000;
-    
-    while (attempts < maxAttempts) {
-        uint64_t mapId = rng.next() % totalMaps;
-        if (finishedMaps.find(mapId) == finishedMaps.end() &&
-            assignedMaps.find(mapId) == assignedMaps.end()) {
-            assignedMaps.insert(mapId);
-            out = computeMapRange(mapId);
-            out.assigned = true;
-            return true;
-        }
-        attempts++;
-    }
-    
-    // Fallback: scan from random start
-    uint64_t startIdx = rng.next() % totalMaps;
-    for (uint64_t i = 0; i < totalMaps; i++) {
-        uint64_t mapId = (startIdx + i) % totalMaps;
-        if (finishedMaps.find(mapId) == finishedMaps.end() &&
-            assignedMaps.find(mapId) == assignedMaps.end()) {
-            assignedMaps.insert(mapId);
-            out = computeMapRange(mapId);
-            out.assigned = true;
-            return true;
-        }
-    }
-    
-    return false;
+    return count;
 }
 
-void MapScheduler::finishMap(uint64_t mapId) {
-    std::lock_guard<std::mutex> lock(schedulerMutex);
-    if (mapId < totalMaps) {
-        finishedMaps.insert(mapId);
-        assignedMaps.erase(mapId);
-    }
+uint64_t CooperativeMapScheduler::getCurrentMapId() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+    return currentMapId;
 }
 
-void MapScheduler::assignMap(uint64_t mapId) {
-    std::lock_guard<std::mutex> lock(schedulerMutex);
-    if (mapId < totalMaps) {
-        assignedMaps.insert(mapId);
-    }
-}
-
-void MapScheduler::unassignMap(uint64_t mapId) {
-    std::lock_guard<std::mutex> lock(schedulerMutex);
-    assignedMaps.erase(mapId);
-}
-
-uint64_t MapScheduler::getTotalMaps() const {
-    return totalMaps;
-}
-
-uint64_t MapScheduler::getCompletedMaps() const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(schedulerMutex));
+uint64_t CooperativeMapScheduler::getCompletedMaps() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
     return finishedMaps.size();
 }
 
-uint64_t MapScheduler::getRemainingMaps() const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(schedulerMutex));
-    return totalMaps - finishedMaps.size() - assignedMaps.size();
-}
-
-uint64_t MapScheduler::getMapSize() const {
-    Int mapSizeCopy;
-    mapSizeCopy.Set(const_cast<Int*>(&mapSize));
-    if (mapSizeCopy.GetBitLength() <= 64) {
-        return mapSize.bits64[0];
-    }
+uint64_t CooperativeMapScheduler::getMapSize() const {
+    Int copy;
+    copy.Set(const_cast<Int*>(&mapSize));
+    if (copy.GetBitLength() <= 64) return mapSize.bits64[0];
     return 0xFFFFFFFFFFFFFFFFULL;
 }
 
-double MapScheduler::getOverallPercent() const {
+double CooperativeMapScheduler::getOverallPercent() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
     if (totalMaps == 0) return 0.0;
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(schedulerMutex));
     return (double)finishedMaps.size() / (double)totalMaps * 100.0;
 }
 
-bool MapScheduler::isComplete() const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(schedulerMutex));
+bool CooperativeMapScheduler::isComplete() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
     return finishedMaps.size() >= totalMaps;
 }
 
-bool MapScheduler::isMapFinished(uint64_t mapId) const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(schedulerMutex));
-    return finishedMaps.find(mapId) != finishedMaps.end();
+ScanMode CooperativeMapScheduler::getMode() const { return mode; }
+
+void CooperativeMapScheduler::setMode(ScanMode m) { mode = m; }
+
+MapRange CooperativeMapScheduler::getCurrentMapRange() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+    MapRange mr;
+    mr.id = currentMapId;
+    mr.start.Set(const_cast<Int*>(&currentMapStart));
+    mr.end.Set(const_cast<Int*>(&currentMapEnd));
+    return mr;
 }
 
-bool MapScheduler::isMapAssigned(uint64_t mapId) const {
-    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(schedulerMutex));
-    return assignedMaps.find(mapId) != assignedMaps.end();
+Int CooperativeMapScheduler::getCurrentOffset() const {
+    std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
+    Int copy;
+    copy.Set(const_cast<Int*>(&currentOffset));
+    return copy;
 }
 
-bool MapScheduler::saveProgress(const std::string& filename, ScanMode saveMode,
-                              uint64_t currentMapId, const Int& currentOffset,
-                              const std::string& startHex, const std::string& endHex,
-                              const std::vector<std::string>& targetHashes) {
-    std::lock_guard<std::mutex> lock(schedulerMutex);
+bool CooperativeMapScheduler::saveProgress(const std::string& filename, ScanMode saveMode,
+                      const Int& currentOffset,
+                      const std::string& startHex, const std::string& endHex,
+                      const std::vector<std::string>& targetHashes) {
+    std::lock_guard<std::mutex> lock(mutex);
     std::ofstream fs(filename);
     if (!fs) return false;
 
-    fs << "Version=3\n";
+    fs << "Version=4\n";
     fs << "Mode=" << (saveMode == ScanMode::SEQUENTIAL ? "Sequential" : "Random") << "\n";
     fs << "StartRange=" << startRange.GetBase16() << "\n";
     fs << "EndRange=" << endRange.GetBase16() << "\n";
     fs << "MapSize=" << getMapSize() << "\n";
     fs << "TotalMaps=" << totalMaps << "\n";
-    fs << "FinishedCount=" << finishedMaps.size() << "\n";
-    
-    for (uint64_t mapId : finishedMaps) {
-        fs << "Finished=" << mapId << "\n";
-    }
-    
     fs << "CurrentMap=" << currentMapId << "\n";
-    
+
     Int offsetCopy;
     offsetCopy.Set(const_cast<Int*>(&currentOffset));
     fs << "CurrentOffset=" << offsetCopy.GetBase16() << "\n";
+
+    fs << "FinishedCount=" << finishedMaps.size() << "\n";
+    for (uint64_t id : finishedMaps) {
+        fs << "Finished=" << id << "\n";
+    }
 
     fs << "TargetCount=" << targetHashes.size() << "\n";
     for (const auto& h : targetHashes) {
@@ -321,10 +159,10 @@ bool MapScheduler::saveProgress(const std::string& filename, ScanMode saveMode,
     return fs.good();
 }
 
-bool MapScheduler::loadProgress(const std::string& filename, ScanMode& loadMode,
-                                uint64_t& currentMapId, Int& currentOffset,
-                                std::string& loadStartHex, std::string& loadEndHex,
-                                std::vector<std::string>& targetHashes) {
+bool CooperativeMapScheduler::loadProgress(const std::string& filename, ScanMode& loadMode,
+                      uint64_t& loadedCurrentMap, Int& loadedOffset,
+                      std::string& loadStartHex, std::string& loadEndHex,
+                      std::vector<std::string>& targetHashes) {
     std::ifstream fs(filename);
     if (!fs) return false;
 
@@ -336,23 +174,18 @@ bool MapScheduler::loadProgress(const std::string& filename, ScanMode& loadMode,
     uint64_t finishedRead = 0;
 
     finishedMaps.clear();
-    assignedMaps.clear();
 
     while (std::getline(fs, line)) {
-        // Remove trailing \r if present (Windows line endings)
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
-        
+        if (!line.empty() && line.back() == '\r') line.pop_back();
         size_t eq = line.find('=');
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
 
         if (key == "Version") {
-            if (val != "3") {
-                std::cerr << "[RESUME] Old progress file format (Version=" << val 
-                          << "). Please start fresh or convert.\n";
+            if (val != "4") {
+                std::cerr << "[RESUME] Old progress file format (Version=" << val
+                          << "). Please start fresh.\n";
                 return false;
             }
         } else if (key == "Mode") {
@@ -370,33 +203,152 @@ bool MapScheduler::loadProgress(const std::string& filename, ScanMode& loadMode,
         } else if (key == "TotalMaps") {
             loadedTotalMaps = std::stoull(val);
             totalMaps = loadedTotalMaps;
+        } else if (key == "CurrentMap") {
+            loadedCurrentMap = std::stoull(val);
+        } else if (key == "CurrentOffset") {
+            loadedOffset.SetBase16(const_cast<char*>(val.c_str()));
         } else if (key == "FinishedCount") {
             loadedFinishedCount = std::stoull(val);
         } else if (key == "Finished") {
-            uint64_t mapId = std::stoull(val);
-            finishedMaps.insert(mapId);
+            finishedMaps.insert(std::stoull(val));
             finishedRead++;
-        } else if (key == "CurrentMap") {
-            currentMapId = std::stoull(val);
-        } else if (key == "CurrentOffset") {
-            currentOffset.SetBase16(const_cast<char*>(val.c_str()));
         } else if (key == "Target") {
             targetHashes.push_back(val);
         }
     }
 
     if (finishedRead != loadedFinishedCount) {
-        std::cerr << "[RESUME] Warning: Expected " << loadedFinishedCount 
+        std::cerr << "[RESUME] Warning: Expected " << loadedFinishedCount
                   << " finished maps but read " << finishedRead << "\n";
     }
 
-    // Recompute nextSequentialHint based on loaded finished maps
+    currentMapId = loadedCurrentMap;
+    mode = (modeStr == "Random") ? ScanMode::RANDOM : ScanMode::SEQUENTIAL;
     nextSequentialHint = 0;
-    while (nextSequentialHint < totalMaps && 
+    while (nextSequentialHint < totalMaps &&
            finishedMaps.find(nextSequentialHint) != finishedMaps.end()) {
         nextSequentialHint++;
     }
 
-    loadMode = (modeStr == "Random") ? ScanMode::RANDOM : ScanMode::SEQUENTIAL;
+    computeCurrentMap();
+    if (!loadedOffset.IsZero() &&
+        !loadedOffset.IsLower(&currentMapStart) &&
+        !loadedOffset.IsGreater(&currentMapEnd)) {
+        currentOffset.Set(&loadedOffset);
+        mapFinished = false;
+    }
+
     return true;
+}
+
+Int CooperativeMapScheduler::integerSqrt(const Int& n) {
+    Int nCopy;
+    nCopy.Set(const_cast<Int*>(&n));
+    if (nCopy.IsZero() || nCopy.IsOne()) return nCopy;
+
+    Int x;
+    x.Set(&nCopy);
+    x.ShiftR(1);
+    Int last;
+    last.Set(&x);
+
+    for (int iter = 0; iter < 300; ++iter) {
+        Int q, rmd;
+        q.Set(&nCopy);
+        q.Div(&x, &rmd);
+        Int sum;
+        sum.Add(&x, &q);
+        sum.ShiftR(1);
+        if (sum.IsEqual(&x) || sum.IsEqual(&last)) {
+            Int sq;
+            sq.Mult(&sum, &sum);
+            if (sq.IsGreater(&nCopy)) sum.SubOne();
+            return sum;
+        }
+        last.Set(&x);
+        x.Set(&sum);
+    }
+    Int sq;
+    sq.Mult(&x, &x);
+    if (sq.IsGreater(&nCopy)) x.SubOne();
+    return x;
+}
+
+void CooperativeMapScheduler::computeCurrentMap() {
+    currentMapStart.Set(&startRange);
+    if (currentMapId > 0) {
+        Int offset;
+        offset.SetInt32(0);
+        offset.SetQWord(0, currentMapId);
+        offset.Mult(&offset, &mapSize);
+        currentMapStart.Add(&offset);
+    }
+
+    currentMapEnd.Set(&currentMapStart);
+    currentMapEnd.Add(&mapSize);
+    currentMapEnd.SubOne();
+
+    if (currentMapEnd.IsGreater(&endRange)) {
+        currentMapEnd.Set(&endRange);
+    }
+
+    currentOffset.Set(&currentMapStart);
+    mapFinished = false;
+}
+
+void CooperativeMapScheduler::advanceToNextMap() {
+    if (mode == ScanMode::SEQUENTIAL) {
+        do {
+            currentMapId++;
+        } while (currentMapId < totalMaps &&
+                 finishedMaps.find(currentMapId) != finishedMaps.end());
+    } else {
+        uint64_t remaining = totalMaps - finishedMaps.size();
+        if (remaining == 0) {
+            currentMapId = totalMaps;
+            return;
+        }
+
+        if (remaining <= 1000) {
+            std::vector<uint64_t> available;
+            for (uint64_t i = 0; i < totalMaps; i++) {
+                if (finishedMaps.find(i) == finishedMaps.end()) {
+                    available.push_back(i);
+                }
+            }
+            if (!available.empty()) {
+                uint64_t idx = std::chrono::steady_clock::now().time_since_epoch().count() % available.size();
+                currentMapId = available[idx];
+            } else {
+                currentMapId = totalMaps;
+            }
+        } else {
+            uint64_t attempts = 0;
+            bool found = false;
+            while (attempts < 1000 && !found) {
+                uint64_t candidate = std::chrono::steady_clock::now().time_since_epoch().count() % totalMaps;
+                if (finishedMaps.find(candidate) == finishedMaps.end()) {
+                    currentMapId = candidate;
+                    found = true;
+                }
+                attempts++;
+            }
+            if (!found) {
+                uint64_t start = std::chrono::steady_clock::now().time_since_epoch().count() % totalMaps;
+                for (uint64_t i = 0; i < totalMaps; i++) {
+                    uint64_t candidate = (start + i) % totalMaps;
+                    if (finishedMaps.find(candidate) == finishedMaps.end()) {
+                        currentMapId = candidate;
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) currentMapId = totalMaps;
+            }
+        }
+    }
+
+    if (currentMapId < totalMaps) {
+        computeCurrentMap();
+    }
 }
