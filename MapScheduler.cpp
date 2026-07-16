@@ -82,6 +82,10 @@ uint64_t CooperativeMapScheduler::getCurrentMapId() const {
     return currentMapId;
 }
 
+uint64_t CooperativeMapScheduler::getTotalMaps() const {
+    return totalMaps;
+}
+
 uint64_t CooperativeMapScheduler::getCompletedMaps() const {
     std::lock_guard<std::mutex> lock(const_cast<std::mutex&>(mutex));
     return finishedMaps.size();
@@ -129,6 +133,7 @@ bool CooperativeMapScheduler::saveProgress(const std::string& filename, ScanMode
                       const Int& currentOffset,
                       const std::string& startHex, const std::string& endHex,
                       const std::vector<std::string>& targetHashes) {
+    (void)endHex; // silences unused-parameter warning; member endRange is used instead
     std::lock_guard<std::mutex> lock(mutex);
     std::ofstream fs(filename);
     if (!fs) return false;
@@ -238,6 +243,7 @@ bool CooperativeMapScheduler::loadProgress(const std::string& filename, ScanMode
         mapFinished = false;
     }
 
+    loadMode = (modeStr == "Random") ? ScanMode::RANDOM : ScanMode::SEQUENTIAL;
     return true;
 }
 
