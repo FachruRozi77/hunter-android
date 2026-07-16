@@ -242,7 +242,7 @@ Point Secp256K1::ComputePublicKey(Int *privKey) {
 // equality checks, and stack-allocated Int temporaries are removed.
 // scratch must point to at least ADD_GEN_SCRATCH Ints (no construction).
 __attribute__((always_inline))
-void Secp256K1::PointAddGenerator(const Point &p1, Point &r, Int *s) {
+void Secp256K1::PointAddGenerator(Point &p1, Point &r, Int *s) {
     // s[0] = u1 = G.y * p1.z
     s[0].ModMulK1(&G.y, &p1.z);
     // s[1] = v1 = G.x * p1.z
