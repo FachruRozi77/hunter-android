@@ -55,7 +55,7 @@ public:
     // generic branches, indirection and temporary Int construction are removed.
     // scratch must point to at least ADD_GEN_SCRATCH Int temporaries.
     static constexpr int ADD_GEN_SCRATCH = 11;
-    void PointAddGenerator(const Point &p, Point &r, Int *scratch);
+    void PointAddGenerator(Point &p, Point &r, Int *scratch);
 
     Point G; // Generator
     Int order; // Curve order
